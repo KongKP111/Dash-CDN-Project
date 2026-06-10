@@ -187,8 +187,13 @@ def build(arch='dash', sit=1, speed=20, rnd=1, use_cli=False):
     if arch == 'dash':
         # Hadis fills the real DASH server logic in servers/dash_server.py.
         # For now we serve the DASH content folder over HTTP on the origin.
-        server.cmd('cd /root/content && python3 -m http.server 8080 '
-                   '> /tmp/dash_server.log 2>&1 &')
+          server.cmd(
+            'python3 /home/diz/sdn-cdn-dash-research/servers/dash_server.py '
+            '--dir /home/diz/sdn-vanet-project/bbb_multi '
+            '--port 8080 '
+            '--log /tmp/dash_server.log '
+            '> /tmp/dash_server_stdout.log 2>&1 &'
+          )
     elif arch == 'cdn':
         # Kongpop fills cdn_origin.py / cdn_edge.py.
         server.cmd('python3 /root/servers/cdn_origin.py '
