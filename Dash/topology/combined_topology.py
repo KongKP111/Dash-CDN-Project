@@ -188,7 +188,7 @@ def build(arch='dash', sit=1, speed=20, rnd=1, use_cli=False):
         # Hadis fills the real DASH server logic in servers/dash_server.py.
         # For now we serve the DASH content folder over HTTP on the origin.
           server.cmd(
-            'python3 /home/diz/sdn-cdn-dash-research/servers/dash_server.py '
+            'python3 /home/diz/sdn-cdn-dash-research/Dash/servers/dash_server.py '
             '--dir /home/diz/sdn-vanet-project/bbb_multi '
             '--port 8080 '
             '--log /tmp/dash_server.log '
