@@ -1,3 +1,19 @@
-*.mp4
-AStream/
+# Python
 *.pyc
+*.pyo
+__pycache__/
+
+# Video content (large files)
+*.mp4
+*.m4s
+*.zip
+AStream/
+
+# Experiment outputs (data collected on lab computer, not in git)
+results/
+results_raw/
+logs/
+*.log
+
+# Temp
+/tmp/

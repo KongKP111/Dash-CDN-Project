@@ -79,12 +79,13 @@ class Representation:
 
 
 class DASHClient:
-    def __init__(self, mpd_url, run_id, out_dir, max_segments=None):
+    def __init__(self, mpd_url, run_id, out_dir, max_segments=None, max_duration=None):
         self.mpd_url      = mpd_url
         self.base_url     = mpd_url.rsplit('/', 1)[0] + '/'
         self.run_id       = run_id
         self.out_dir      = out_dir
         self.max_segments = max_segments
+        self.max_duration = max_duration
 
         self.reps          = []        # sorted ascending by bandwidth
         self.seg_durations = []        # seconds per segment, from timeline
@@ -102,9 +103,27 @@ class DASHClient:
 
     # ---- MPD parsing -----------------------------------------------------
     def fetch_mpd(self):
-        with urllib.request.urlopen(urllib.request.Request(self.mpd_url),
-                                    timeout=HTTP_TIMEOUT) as r:
-            data = r.read().decode('utf-8', errors='ignore')
+        # Retry the initial MPD fetch: right after a (re)association the
+        # OpenFlow rules / ARP entries may not be installed yet, so the very
+        # first request can fail with "No route to host". A real adaptive
+        # player also retries instead of giving up, so this is realistic.
+        data = None
+        last_err = None
+        for attempt in range(1, 21):   # up to ~20 tries
+            try:
+                with urllib.request.urlopen(
+                        urllib.request.Request(self.mpd_url),
+                        timeout=HTTP_TIMEOUT) as r:
+                    data = r.read().decode('utf-8', errors='ignore')
+                break
+            except Exception as e:
+                last_err = e
+                sys.stderr.write(
+                    f'[CLIENT] MPD fetch attempt {attempt} failed '
+                    f'({e}); retrying...\n')
+                time.sleep(1.0)
+        if data is None:
+            sys.exit(f'[ERROR] Could not fetch MPD after retries: {last_err}')
         root = ET.fromstring(data)
         ns = root.tag.split('}')[0] + '}' if root.tag.startswith('{') else ''
 
@@ -186,6 +205,15 @@ class DASHClient:
 
         n_total = len(self.seg_durations)
         while True:
+            # Stop if we've run past the allotted wall-clock duration
+            # (emulates the vehicle leaving the coverage area)
+            if self.max_duration is not None:
+                elapsed = time.time() - self.session_start
+                if elapsed >= self.max_duration:
+                    sys.stderr.write(
+                        f'[CLIENT] Reached max_duration '
+                        f'({self.max_duration:.1f}s), stopping.\n')
+                    break
             if self.max_segments and seg_number > self.max_segments:
                 break
             if n_total and seg_number > n_total:
@@ -193,10 +221,37 @@ class DASHClient:
 
             rep = self.choose_representation(last_tp)
             url = rep.media_url(self.base_url, seg_number)
-            try:
-                seg_bytes, dt = self.download(url)
-            except Exception:
-                break   # end of stream / no segment
+            # Retry the segment a few times: during a handover the route is
+            # briefly unavailable. We treat that gap as buffering time rather
+            # than ending the session, which mirrors real player behaviour.
+            seg_bytes, dt = None, None
+            handover_wait = 0.0
+            for dl_attempt in range(1, 9):   # up to 8 quick retries
+                try:
+                    seg_bytes, dt = self.download(url)
+                    break
+                except Exception:
+                    # Stop retrying if we've already exceeded the duration cap
+                    if self.max_duration is not None:
+                        if (time.time() - self.session_start) >= self.max_duration:
+                            break
+                    handover_wait += 0.5
+                    time.sleep(0.5)
+            if seg_bytes is None:
+                # Could not fetch this segment (likely past end-of-run or a
+                # long outage). If we have produced rows already, stop cleanly
+                # so the summary is still written; otherwise break out.
+                if self.max_duration is not None and \
+                   (time.time() - self.session_start) >= self.max_duration:
+                    break
+                # account the lost time as a stall, then move on
+                self.buffer -= handover_wait
+                if self.buffer < 0:
+                    self.stall_count += 1
+                    self.stall_time += -self.buffer
+                    self.buffer = 0.0
+                seg_number += 1
+                continue
 
             throughput_kbps = (seg_bytes * 8 / 1000.0) / dt
             last_tp = throughput_kbps
@@ -279,8 +334,11 @@ def main():
     ap.add_argument('--run-id', required=True, help='unique run id for logs')
     ap.add_argument('--out', default='/tmp/dash_logs', help='output directory')
     ap.add_argument('--max-segments', type=int, default=None)
+    ap.add_argument('--duration', type=float, default=None,
+                    help='max wall-clock seconds to stream (stops and writes logs)')
     args = ap.parse_args()
-    DASHClient(args.url, args.run_id, args.out, args.max_segments).run()
+    DASHClient(args.url, args.run_id, args.out, args.max_segments,
+               max_duration=args.duration).run()
 
 
 if __name__ == '__main__':
