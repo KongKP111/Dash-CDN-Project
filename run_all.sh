@@ -9,7 +9,7 @@
 set -euo pipefail
 
 ARCH_LIST=("dash")
-SIT_LIST=(1 2 3 4 5)
+SIT_LIST=(1 2)
 SPEED_LIST=(20 25 30)
 ROUND_LIST=(1 2 3 4 5 6 7 8 9 10)
 RESUME=false
@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --sit)
             if [[ "$2" == "all" ]]; then
-                SIT_LIST=(1 2 3 4 5)
+                SIT_LIST=(1 2)
             else
                 SIT_LIST=("$2")
             fi
