@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 PROJECT="/home/diz/sdn-cdn-dash-research"
-TOPO="$PROJECT/Dash/topology/combined_topology.py"
+TOPO="$PROJECT/Dash/topology/dash_topology.py"
 RYU_CTRL="$PROJECT/Ryu-SDN-Controller/sdn_controller.py"
 RUN_ID="${ARCH}_sit${SIT}_spd${SPEED}_r${ROUND}"
 LOG_DIR="/tmp/dash_logs/${RUN_ID}"
@@ -88,7 +88,6 @@ echo "[3/4] Running topology + client (this takes a few minutes)..."
 mkdir -p "$LOG_DIR"
 
 sudo python3 "$TOPO" \
-    --arch "$ARCH" \
     --sit  "$SIT" \
     --speed "$SPEED" \
     --round "$ROUND" \
