@@ -23,7 +23,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-PROJECT="/home/diz/sdn-cdn-dash-research"
+PROJECT="/home/pc1/sdn-cdn-dash-research"
 TOPO="$PROJECT/Dash/topology/dash_topology.py"
 RYU_CTRL="$PROJECT/Ryu-SDN-Controller/sdn_controller.py"
 RUN_ID="${ARCH}_sit${SIT}_spd${SPEED}_r${ROUND}"

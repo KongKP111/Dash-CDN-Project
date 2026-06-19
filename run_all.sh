@@ -13,7 +13,7 @@ SIT_LIST=(1 2)
 SPEED_LIST=(20 25 30)
 ROUND_LIST=(1 2 3 4 5 6 7 8 9 10)
 RESUME=false
-PROJECT="/home/diz/sdn-cdn-dash-research"
+PROJECT="/home/pc1/sdn-cdn-dash-research"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 while [[ $# -gt 0 ]]; do

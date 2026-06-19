@@ -3,25 +3,34 @@
 ============================================================================
   Adaptive DASH Client  (used by BOTH SDN-DASH and SDN-CDN)
 ----------------------------------------------------------------------------
-  A headless MPEG-DASH client that emulates a real adaptive video player.
-  The SAME client is used for both architectures so the only variable that
-  differs between experiments is WHERE the content is served from
-  (central server vs. edge cache). This keeps the comparison fair.
+  A headless MPEG-DASH client that emulates a real adaptive video player
+  with a REAL-TIME playout model. The SAME client is used for both
+  architectures so the only variable that differs between experiments is
+  WHERE the content is served from (central server vs. edge cache).
+
+  Playback model : REAL-TIME buffer-based playout.
+      - A virtual playout clock advances with wall-clock time. The buffer is
+        drained at 1 s of media per 1 s of real time once playback begins.
+      - The player paces itself: when the buffer reaches the target it stops
+        fetching ahead and waits, exactly like a real adaptive player. This
+        guarantees media_played_s <= session_duration_s.
+      - When the buffer underruns (e.g. during a handover gap) playback
+        STALLS; the stall duration is the real wall-clock time the player
+        waits with an empty buffer, and a rebuffering event is counted.
+      - Startup delay (time-to-first-frame) is measured explicitly.
 
   Adaptation logic : Throughput-based (rate-based) ABR.
-      - Standard "conventional" DASH adaptation.
       - Pick the highest representation whose bitrate <= measured throughput
         x a safety factor, constrained by the current buffer level.
-      - On buffer underrun -> a stall (rebuffering) event is recorded.
 
   Segment timing   : Parsed from the MPD <SegmentTimeline> (variable segment
-      durations) using the AdaptationSet timescale. This makes the buffer /
-      stall model accurate to the real content rather than assuming a fixed
-      segment length.
+      durations) using the AdaptationSet timescale, so the buffer / stall
+      model is accurate to the real content.
 
-  Reference model  : MPEG-DASH (ISO/IEC 23009-1); rate-based adaptation as
-      surveyed in Seufert et al., "A Survey on QoE of HTTP Adaptive
-      Streaming," IEEE Comm. Surveys & Tutorials, 2015.
+  Reference model  : MPEG-DASH (ISO/IEC 23009-1); rate-based adaptation and
+      QoE metrics (startup delay, stall count/duration, rebuffering ratio,
+      quality switches) as surveyed in Seufert et al., "A Survey on QoE of
+      HTTP Adaptive Streaming," IEEE Comm. Surveys & Tutorials, 2015.
 
   Metrics logged (CSV) -> one row per downloaded segment:
       seg_index, timestamp, representation, bitrate_kbps, seg_dur_s,
@@ -48,10 +57,12 @@ import xml.etree.ElementTree as ET
 # ---------------------------------------------------------------------------
 #  Player constants (standard buffer-based playback model)
 # ---------------------------------------------------------------------------
-BUFFER_TARGET = 24.0      # seconds: target buffer we try to keep filled
-BUFFER_MIN    = 4.0       # seconds: below this we throttle quality down
-SAFETY_FACTOR = 0.90      # use 90% of measured throughput for safety
-HTTP_TIMEOUT  = 15.0      # per-request timeout (seconds)
+BUFFER_TARGET  = 24.0     # seconds: target buffer; player stops fetching above this
+BUFFER_MIN     = 4.0      # seconds: below this the ABR throttles quality down
+STARTUP_BUFFER = 4.0      # seconds: buffer required before playback starts
+SAFETY_FACTOR  = 0.90     # use 90% of measured throughput for safety
+HTTP_TIMEOUT   = 15.0     # per-request timeout (seconds)
+PACE_SLEEP     = 0.1      # seconds: granularity of the pacing / playout loop
 
 
 class Representation:
@@ -90,9 +101,18 @@ class DASHClient:
         self.reps          = []        # sorted ascending by bandwidth
         self.seg_durations = []        # seconds per segment, from timeline
         self.timescale     = 1
-        self.buffer        = 0.0
+
+        # --- real-time playout state ---
+        self.buffer        = 0.0       # seconds of media downloaded, not yet played
+        self.played_media  = 0.0       # seconds of media actually played out (real time)
+        self.downloaded_media = 0.0    # seconds of media fetched into the buffer
         self.stall_count   = 0
         self.stall_time    = 0.0
+        self.playing       = False     # has playback started?
+        self.startup_delay = None      # seconds: time-to-first-frame
+        self._in_stall     = False
+        self._last_tick    = None      # wall-clock of last playout update
+
         self.rows          = []
         self.total_bytes   = 0
         self.session_start = None
@@ -189,10 +209,46 @@ class DASHClient:
                 break
         return chosen
 
+    # ---- Real-time playout clock ----------------------------------------
+    def _advance_playback(self):
+        """Advance the virtual playout clock by the real wall-clock time that
+        has elapsed since the last call. Once playback has started, the buffer
+        is drained 1 s of media per 1 s of real time. If the buffer underruns,
+        the remaining real time is counted as stall (rebuffering) and a stall
+        event is registered on entry into the stalled state.
+
+        Returns the stall time incurred during this advance (seconds)."""
+        now = time.time()
+        if self._last_tick is None:
+            self._last_tick = now
+            return 0.0
+        dt = now - self._last_tick
+        self._last_tick = now
+        if dt <= 0 or not self.playing:
+            return 0.0
+
+        stall = 0.0
+        if self.buffer >= dt:
+            # enough buffered media to cover the elapsed time -> smooth play
+            self.buffer -= dt
+            self.played_media += dt
+            self._in_stall = False
+        else:
+            # play out what is left, then stall for the remainder
+            self.played_media += self.buffer
+            stall = dt - self.buffer
+            self.buffer = 0.0
+            self.stall_time += stall
+            if not self._in_stall:        # count one event per stall episode
+                self.stall_count += 1
+                self._in_stall = True
+        return stall
+
     # ---- Main streaming loop --------------------------------------------
     def run(self):
         self.fetch_mpd()
         self.session_start = time.time()
+        self._last_tick    = self.session_start
         last_tp = self.reps[0].bitrate_kbps
         seg_number = 1
 
@@ -205,11 +261,12 @@ class DASHClient:
 
         n_total = len(self.seg_durations)
         while True:
-            # Stop if we've run past the allotted wall-clock duration
-            # (emulates the vehicle leaving the coverage area)
+            # 1) advance the real-time playout clock first
+            self._advance_playback()
+
+            # 2) stop when the vehicle leaves the coverage area (wall-clock)
             if self.max_duration is not None:
-                elapsed = time.time() - self.session_start
-                if elapsed >= self.max_duration:
+                if (time.time() - self.session_start) >= self.max_duration:
                     sys.stderr.write(
                         f'[CLIENT] Reached max_duration '
                         f'({self.max_duration:.1f}s), stopping.\n')
@@ -219,37 +276,40 @@ class DASHClient:
             if n_total and seg_number > n_total:
                 break
 
+            # 3) pacing: if the buffer is full, do NOT fetch ahead. Sleep a
+            #    little and let the playout clock drain it. This is what makes
+            #    the session run in real time (a real player behaves this way).
+            if self.playing and self.buffer >= BUFFER_TARGET:
+                time.sleep(PACE_SLEEP)
+                continue
+
+            # 4) choose quality and fetch the next segment
             rep = self.choose_representation(last_tp)
             url = rep.media_url(self.base_url, seg_number)
-            # Retry the segment a few times: during a handover the route is
-            # briefly unavailable. We treat that gap as buffering time rather
-            # than ending the session, which mirrors real player behaviour.
+
+            stall_before = self.stall_time
             seg_bytes, dt = None, None
-            handover_wait = 0.0
             for dl_attempt in range(1, 9):   # up to 8 quick retries
                 try:
                     seg_bytes, dt = self.download(url)
                     break
                 except Exception:
-                    # Stop retrying if we've already exceeded the duration cap
-                    if self.max_duration is not None:
-                        if (time.time() - self.session_start) >= self.max_duration:
-                            break
-                    handover_wait += 0.5
+                    # during a handover the route is briefly unavailable; the
+                    # buffer keeps draining in real time while we wait, which
+                    # is exactly what causes a real stall.
+                    if self.max_duration is not None and \
+                       (time.time() - self.session_start) >= self.max_duration:
+                        break
                     time.sleep(0.5)
+                    self._advance_playback()
+            # account for the real time spent on the (successful) download
+            self._advance_playback()
+
             if seg_bytes is None:
-                # Could not fetch this segment (likely past end-of-run or a
-                # long outage). If we have produced rows already, stop cleanly
-                # so the summary is still written; otherwise break out.
+                # could not fetch (long outage or end-of-run)
                 if self.max_duration is not None and \
                    (time.time() - self.session_start) >= self.max_duration:
                     break
-                # account the lost time as a stall, then move on
-                self.buffer -= handover_wait
-                if self.buffer < 0:
-                    self.stall_count += 1
-                    self.stall_time += -self.buffer
-                    self.buffer = 0.0
                 seg_number += 1
                 continue
 
@@ -258,16 +318,16 @@ class DASHClient:
             self.total_bytes += seg_bytes
 
             seg_dur = self.seg_duration(seg_number)
+            self.buffer += seg_dur                 # new media enters the buffer
+            self.downloaded_media += seg_dur
 
-            # buffer + stall model (variable segment duration)
-            stall_this = 0.0
-            self.buffer -= dt
-            if self.buffer < 0:
-                stall_this = -self.buffer
-                self.stall_count += 1
-                self.stall_time += stall_this
-                self.buffer = 0.0
-            self.buffer = min(self.buffer + seg_dur, BUFFER_TARGET)
+            # start playback once the startup buffer is reached
+            if not self.playing and self.buffer >= STARTUP_BUFFER:
+                self.playing = True
+                self.startup_delay = round(time.time() - self.session_start, 3)
+                self._last_tick = time.time()      # start draining from now
+
+            stall_this = self.stall_time - stall_before
 
             ts = round(time.time() - self.session_start, 3)
             switched = bool(self.rows) and self.rows[-1]['representation'] != rep.id
@@ -302,19 +362,24 @@ class DASHClient:
         avg_bitrate = sum(r['bitrate_kbps'] for r in self.rows) / n if n else 0
         avg_tp = sum(r['throughput_kbps'] for r in self.rows) / n if n else 0
         switches = sum(1 for r in self.rows if r['action'] == 'switch')
-        played_media = sum(r['seg_dur_s'] for r in self.rows)
+
+        # real-time playout: media actually played out (<= session duration)
+        played_media = round(self.played_media, 2)
+        rebuf_denom = self.played_media + self.stall_time
 
         summary = {
             'run_id': self.run_id,
             'mpd_url': self.mpd_url,
             'segments_played': n,
-            'media_played_s': round(played_media, 2),
+            'media_played_s': played_media,
+            'media_downloaded_s': round(self.downloaded_media, 2),
             'session_duration_s': round(duration, 2),
+            'startup_delay_s': self.startup_delay if self.startup_delay is not None else round(duration, 3),
             'avg_bitrate_kbps': round(avg_bitrate, 1),
             'avg_throughput_kbps': round(avg_tp, 1),
             'total_stall_events': self.stall_count,
             'total_stall_duration_s': round(self.stall_time, 3),
-            'rebuffering_ratio': round(self.stall_time / (played_media + self.stall_time), 4) if played_media else 0,
+            'rebuffering_ratio': round(self.stall_time / rebuf_denom, 4) if rebuf_denom else 0,
             'quality_switches': switches,
             'total_bytes': self.total_bytes,
         }
