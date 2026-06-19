@@ -4,6 +4,8 @@ from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISP
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ether_types
+import os
+import time
 
 
 class MobilityAwareFlowSwitch13(app_manager.RyuApp):
@@ -12,6 +14,14 @@ class MobilityAwareFlowSwitch13(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(MobilityAwareFlowSwitch13, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
+
+        # --- Handover Execution Time instrumentation ---
+        self.run_id = os.environ.get('RUN_ID', 'unknown')
+        self.ho_pending = {}          # barrier xid -> (t_start, dpid, mac)
+        self.ho_start = {}            # (dpid, mac) -> t_start (pending handover)
+        self._ho_csv = open('/app/handover_times.csv', 'w')
+        self._ho_csv.write('run_id,wall_ts,dpid,mac,handover_exec_ms\n')
+        self._ho_csv.flush()
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -91,6 +101,28 @@ class MobilityAwareFlowSwitch13(app_manager.RyuApp):
 
         self.logger.info("Deleted stale flows for MAC=%s on dpid=%s", mac, datapath.id)
 
+    def _send_ho_barrier(self, datapath, parser, dpid, mac):
+        # Flow-rule update time: from sending the new flow-mod until the
+        # barrier reply confirms it is installed on the switch.
+        t_send = time.time()
+        req = parser.OFPBarrierRequest(datapath)
+        datapath.send_msg(req)
+        self.ho_pending[req.xid] = (t_send, dpid, mac)
+
+    @set_ev_cls(ofp_event.EventOFPBarrierReply, MAIN_DISPATCHER)
+    def _barrier_reply_handler(self, ev):
+        xid = ev.msg.xid
+        info = self.ho_pending.pop(xid, None)
+        if info is None:
+            return
+        t_start, dpid, mac = info
+        exec_ms = (time.time() - t_start) * 1000.0
+        self.logger.info("Handover exec time: dpid=%s mac=%s %.3f ms",
+                         dpid, mac, exec_ms)
+        self._ho_csv.write('%s,%.6f,%s,%s,%.3f\n' % (
+            self.run_id, time.time(), dpid, mac, exec_ms))
+        self._ho_csv.flush()
+
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def state_change_handler(self, ev):
         datapath = ev.datapath
@@ -123,7 +155,9 @@ class MobilityAwareFlowSwitch13(app_manager.RyuApp):
         old_port = self.mac_to_port[dpid].get(src)
 
         # Detect mobility / handover by MAC moving to a new port
-        if old_port is not None and old_port != in_port:
+        handover_now = (old_port is not None and old_port != in_port)
+        if handover_now:
+            self.ho_start[(dpid, src)] = time.time()   # remember handover start
             self.logger.info(
                 "Mobility detected: dpid=%s mac=%s old_port=%s new_port=%s",
                 dpid, src, old_port, in_port
@@ -164,6 +198,9 @@ class MobilityAwareFlowSwitch13(app_manager.RyuApp):
                     idle_timeout=8,
                     hard_timeout=0
                 )
+                if (dpid, src) in self.ho_start:
+                    self.ho_start.pop((dpid, src))
+                    self._send_ho_barrier(datapath, parser, dpid, src)
                 return
             else:
                 self.add_flow(
@@ -174,6 +211,9 @@ class MobilityAwareFlowSwitch13(app_manager.RyuApp):
                     idle_timeout=8,
                     hard_timeout=0
                 )
+                if (dpid, src) in self.ho_start:
+                    self.ho_start.pop((dpid, src))
+                    self._send_ho_barrier(datapath, parser, dpid, src)
 
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:

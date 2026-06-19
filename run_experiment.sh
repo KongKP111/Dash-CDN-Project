@@ -64,6 +64,7 @@ echo "[2/4] Starting Ryu controller..."
 docker run -d --rm \
     --name ryu_ctrl \
     --network host \
+    -e RUN_ID="$RUN_ID" \
     -v "$PROJECT/Ryu-SDN-Controller":/app \
     osrg/ryu \
     ryu-manager /app/sdn_controller.py \
@@ -109,6 +110,9 @@ cp "$LOG_DIR"/*.csv  "$RESULTS_DIR/" 2>/dev/null || true
 cp "$LOG_DIR"/*.json "$RESULTS_DIR/" 2>/dev/null || true
 cp "/tmp/client_${RUN_ID}.log" "$RESULTS_DIR/" 2>/dev/null || true
 cp "/tmp/topo_${RUN_ID}.log"   "$RESULTS_DIR/" 2>/dev/null || true
+
+cp "$PROJECT/Ryu-SDN-Controller/handover_times.csv" "$RESULTS_DIR/${RUN_ID}_handover.csv" 2>/dev/null || true
+docker logs ryu_ctrl > "$RESULTS_DIR/${RUN_ID}_ryu.log" 2>&1 || true
 
 if ls "$RESULTS_DIR"/*.json 1>/dev/null 2>&1; then
     echo ""
