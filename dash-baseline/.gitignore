@@ -1,0 +1,17 @@
+# experiment outputs (regenerated on each run)
+results/
+results_*/
+*.csv
+!.gitkeep
+# figures
+*.png
+aggregate.png
+# logs & temp
+/tmp/
+*.log
+__pycache__/
+*.pyc
+# editor
+.vscode/
+.idea/
+*.swp

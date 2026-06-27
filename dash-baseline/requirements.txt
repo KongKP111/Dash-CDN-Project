@@ -1,0 +1,5 @@
+# Python deps for the plotting/aggregation scripts (run as the normal user).
+# The experiment itself (baseline_topo.py) additionally needs Mininet-WiFi,
+# which is installed system-wide (python3.12 dist-packages), not via pip.
+numpy>=1.24
+matplotlib>=3.6
