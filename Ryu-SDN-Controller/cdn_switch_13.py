@@ -8,6 +8,9 @@
 #   5. Flood filter for non-ARP broadcast (reduces unnecessary floods)
 # ============================================================
 
+import os
+import time
+
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
@@ -33,6 +36,17 @@ class CDNSwitch13(app_manager.RyuApp):
         self.mac_to_port = {}
         # {ip: mac}  — global ARP/IP learning table (ช่วย debug)
         self.ip_to_mac   = {}
+
+        self.run_id     = os.environ.get('RUN_ID', 'unknown')
+        self.ho_pending = {}   # barrier xid -> (t_send, dpid, mac)
+        self.ho_start   = {}   # (dpid, mac) -> pending handover flag
+        ho_csv_path = os.environ.get(
+            'HANDOVER_CSV_PATH',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'handover_times.csv'))
+        os.makedirs(os.path.dirname(ho_csv_path), exist_ok=True)
+        self._ho_csv = open(ho_csv_path, 'w')
+        self._ho_csv.write('run_id,wall_ts,dpid,mac,handover_exec_ms\n')
+        self._ho_csv.flush()
 
     # ────────────────────────────────────────────────────────
     # Switch connects → install table-miss flow
@@ -74,6 +88,26 @@ class CDNSwitch13(app_manager.RyuApp):
         datapath.send_msg(parser.OFPFlowMod(**kwargs))
 
     # ────────────────────────────────────────────────────────
+    # Helper: delete all flows for a MAC (called on handover)
+    # ────────────────────────────────────────────────────────
+    def delete_flows_for_mac(self, datapath, mac):
+        ofproto = datapath.ofproto
+        parser  = datapath.ofproto_parser
+
+        for match in (parser.OFPMatch(eth_dst=mac), parser.OFPMatch(eth_src=mac)):
+            mod = parser.OFPFlowMod(
+                datapath   = datapath,
+                command    = ofproto.OFPFC_DELETE,
+                out_port   = ofproto.OFPP_ANY,
+                out_group  = ofproto.OFPG_ANY,
+                priority   = self.PRIO_LEARNED,
+                match      = match,
+            )
+            datapath.send_msg(mod)
+
+        self.logger.info("[DPID %s] deleted stale flows for MAC %s", datapath.id, mac)
+
+    # ────────────────────────────────────────────────────────
     # Packet-In handler
     # ────────────────────────────────────────────────────────
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
@@ -97,9 +131,16 @@ class CDNSwitch13(app_manager.RyuApp):
 
         # ── MAC learning ─────────────────────────────────────
         self.mac_to_port.setdefault(dpid, {})
-        if self.mac_to_port[dpid].get(src) != in_port:
+        old_port = self.mac_to_port[dpid].get(src)
+        if old_port != in_port:
             self.mac_to_port[dpid][src] = in_port
             self.logger.info("[DPID %s] MAC learned: %s on port %s", dpid, src, in_port)
+
+        # ── Handover detection (MAC moved to new port) ────────
+        if old_port is not None and old_port != in_port:
+            self.logger.info("[DPID %s] handover: %s port %s -> %s", dpid, src, old_port, in_port)
+            self.ho_start[(dpid, src)] = True
+            self.delete_flows_for_mac(datapath, src)
 
         # ── ARP learning (ip_to_mac) ─────────────────────────
         arp_pkt = pkt.get_protocol(arp.arp)
@@ -134,10 +175,16 @@ class CDNSwitch13(app_manager.RyuApp):
                 self.add_flow(datapath, self.PRIO_LEARNED, match, actions,
                               buffer_id=msg.buffer_id,
                               idle_timeout=self.FLOW_IDLE_TIMEOUT)
+                if (dpid, src) in self.ho_start:
+                    self.ho_start.pop((dpid, src))
+                    self._send_ho_barrier(datapath, parser, dpid, src)
                 return
             else:
                 self.add_flow(datapath, self.PRIO_LEARNED, match, actions,
                               idle_timeout=self.FLOW_IDLE_TIMEOUT)
+                if (dpid, src) in self.ho_start:
+                    self.ho_start.pop((dpid, src))
+                    self._send_ho_barrier(datapath, parser, dpid, src)
 
         # ── Send packet out ───────────────────────────────────
         data = None
@@ -152,3 +199,24 @@ class CDNSwitch13(app_manager.RyuApp):
             data      = data,
         )
         datapath.send_msg(out)
+
+    # ────────────────────────────────────────────────────────
+    # Handover timing helpers
+    # ────────────────────────────────────────────────────────
+    def _send_ho_barrier(self, datapath, parser, dpid, mac):
+        t_send = time.time()
+        req = parser.OFPBarrierRequest(datapath)
+        datapath.send_msg(req)
+        self.ho_pending[req.xid] = (t_send, dpid, mac)
+
+    @set_ev_cls(ofp_event.EventOFPBarrierReply, MAIN_DISPATCHER)
+    def _barrier_reply_handler(self, ev):
+        info = self.ho_pending.pop(ev.msg.xid, None)
+        if info is None:
+            return
+        t_send, dpid, mac = info
+        exec_ms = (time.time() - t_send) * 1000.0
+        self._ho_csv.write('%s,%.6f,%s,%s,%.3f\n' % (
+            self.run_id, time.time(), dpid, mac, exec_ms))
+        self._ho_csv.flush()
+        self.logger.info("[DPID %s] handover exec: %s -> %.3f ms", dpid, mac, exec_ms)

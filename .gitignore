@@ -9,7 +9,7 @@ __pycache__/
 *.zip
 AStream/
 
-# Experiment outputs (data collected on lab computer, not in git)
+# Experiment outputs
 results/
 results_raw/
 logs/
@@ -19,3 +19,9 @@ logs/
 /tmp/
 Ryu-SDN-Controller/handover_times.csv
 *.bak
+
+# CDN-specific
+CDN/edge/edge*_cache/
+CDN/topology/__pycache__/
+.claude/CDN/rssi_real_campus_cdn.csv
+CDN/rssi_real_campus_cdn.csv
