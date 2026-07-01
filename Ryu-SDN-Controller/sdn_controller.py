@@ -11,17 +11,39 @@ import time
 class MobilityAwareFlowSwitch13(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
+    # Shared with the host over the bind-mounted /tmp (see run_4rsu_multi.sh /
+    # baseline_4rsu_topo.py). The controller is a single long-running process
+    # across all N runs of a batch (docker --restart=always), so instead of
+    # restarting the container to change RUN_ID per run, the topology script
+    # just (re)writes this file at the start of each run and we read it fresh
+    # on every handover -- no container restart needed between runs.
+    RUN_ID_FILE = '/tmp/current_run_id.txt'
+    HO_CSV = '/tmp/handover_times.csv'
+
     def __init__(self, *args, **kwargs):
         super(MobilityAwareFlowSwitch13, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
 
         # --- Handover Execution Time instrumentation ---
-        self.run_id = os.environ.get('RUN_ID', 'unknown')
         self.ho_pending = {}          # barrier xid -> (t_start, dpid, mac)
         self.ho_start = {}            # (dpid, mac) -> t_start (pending handover)
-        self._ho_csv = open('/app/handover_times.csv', 'w')
-        self._ho_csv.write('run_id,wall_ts,dpid,mac,handover_exec_ms\n')
-        self._ho_csv.flush()
+        self._ensure_ho_csv_header()
+
+    def _ensure_ho_csv_header(self):
+        # Checked on every write (not just __init__): the host-side batch
+        # script may `rm` this file between batches to start a clean dataset
+        # while this long-running container keeps going -- so the header
+        # must be re-created the next time it's missing, not just once.
+        if not os.path.exists(self.HO_CSV) or os.path.getsize(self.HO_CSV) == 0:
+            with open(self.HO_CSV, 'w') as f:
+                f.write('run_id,wall_ts,dpid,mac,handover_exec_ms\n')
+
+    def _current_run_id(self):
+        try:
+            with open(self.RUN_ID_FILE) as f:
+                return f.read().strip() or 'unknown'
+        except (IOError, OSError):
+            return os.environ.get('RUN_ID', 'unknown')
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -29,7 +51,10 @@ class MobilityAwareFlowSwitch13(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        self.mac_to_port.setdefault(datapath.id, {})
+        # Fresh dict on every (re)connect: dpids get reused across `mn -c`
+        # teardown/rebuild cycles within the same long-running controller,
+        # so a prior run's port mappings must not leak into the next one.
+        self.mac_to_port[datapath.id] = {}
 
         # table-miss: send unmatched packets to controller
         match = parser.OFPMatch()
@@ -117,11 +142,13 @@ class MobilityAwareFlowSwitch13(app_manager.RyuApp):
             return
         t_start, dpid, mac = info
         exec_ms = (time.time() - t_start) * 1000.0
-        self.logger.info("Handover exec time: dpid=%s mac=%s %.3f ms",
-                         dpid, mac, exec_ms)
-        self._ho_csv.write('%s,%.6f,%s,%s,%.3f\n' % (
-            self.run_id, time.time(), dpid, mac, exec_ms))
-        self._ho_csv.flush()
+        run_id = self._current_run_id()
+        self.logger.info("Handover exec time: run=%s dpid=%s mac=%s %.3f ms",
+                         run_id, dpid, mac, exec_ms)
+        self._ensure_ho_csv_header()
+        with open(self.HO_CSV, 'a') as f:
+            f.write('%s,%.6f,%s,%s,%.3f\n' % (
+                run_id, time.time(), dpid, mac, exec_ms))
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def state_change_handler(self, ev):

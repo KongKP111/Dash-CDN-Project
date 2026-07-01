@@ -6,10 +6,12 @@ the `sudo -> /root` home-directory pitfall.
 import os
 
 # Your login name. Auto-detected under sudo via SUDO_USER; if that is empty
-# (e.g. nested sudo in the batch script) it falls back to DEFAULT_USER instead
-# of root, so paths never resolve to /root by accident.
+# OR "root" (nested sudo -- e.g. `sudo ./run_4rsu_multi.sh` wrapping an inner
+# `sudo python3 ...`, where the inner call's invoking user IS root) it falls
+# back to DEFAULT_USER instead, so paths never resolve to /root by accident.
 DEFAULT_USER = "diz"                     # <-- set to your username
-USER = os.environ.get("SUDO_USER") or DEFAULT_USER
+_sudo_user = os.environ.get("SUDO_USER")
+USER = _sudo_user if (_sudo_user and _sudo_user != "root") else DEFAULT_USER
 
 HOME = "/home/%s" % USER                 # <-- edit if your home is elsewhere
 
