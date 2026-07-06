@@ -1,0 +1,16 @@
+{
+  "run_id": "dash_sit2_spd20_r9",
+  "mpd_url": "http://10.0.0.10:8080/index.mpd",
+  "segments_played": 32,
+  "media_played_s": 117.56,
+  "media_downloaded_s": 128.0,
+  "session_duration_s": 117.69,
+  "startup_delay_s": 0.131,
+  "avg_bitrate_kbps": 2623.3,
+  "avg_throughput_kbps": 4415.1,
+  "total_stall_events": 0,
+  "total_stall_duration_s": 0.0,
+  "rebuffering_ratio": 0.0,
+  "quality_switches": 7,
+  "total_bytes": 42250975
+}

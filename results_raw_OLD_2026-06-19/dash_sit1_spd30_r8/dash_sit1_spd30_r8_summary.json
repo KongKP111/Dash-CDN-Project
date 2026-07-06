@@ -1,0 +1,16 @@
+{
+  "run_id": "dash_sit1_spd30_r8",
+  "mpd_url": "http://10.0.0.10:8080/index.mpd",
+  "segments_played": 20,
+  "media_played_s": 66.11,
+  "media_downloaded_s": 80.0,
+  "session_duration_s": 70.3,
+  "startup_delay_s": 0.082,
+  "avg_bitrate_kbps": 4700.3,
+  "avg_throughput_kbps": 7355.0,
+  "total_stall_events": 1,
+  "total_stall_duration_s": 4.102,
+  "rebuffering_ratio": 0.0584,
+  "quality_switches": 7,
+  "total_bytes": 46542448
+}
