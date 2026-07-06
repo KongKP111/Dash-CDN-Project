@@ -87,7 +87,7 @@ def cdn_qoe(cache_status, latency_s, handover, stall):
     if cache_status == "HIT":
         score = QOE_HIT_FULL if latency_s < HIT_FULL_LATENCY_S else QOE_HIT_PARTIAL
     else:
-        score = QOE_MISS_NORMAL
-    if handover:
+        score = QOE_MISS_NORMAL #haha
+    if handover: 
         score -= SWITCH_PENALTY
     return max(1.0, min(5.0, score))
