@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /home/kongpop/PSU_Project/Dash-CDN-Project/CDN/CDN_run_experiment.sh)",
+      "Bash(python3 -m py_compile /home/kongpop/PSU_Project/Dash-CDN-Project/CDN/topology/real_campus_live.py)"
+    ]
+  }
+}

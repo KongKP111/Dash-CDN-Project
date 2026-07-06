@@ -141,6 +141,13 @@ class CDNSwitch13(app_manager.RyuApp):
             self.logger.info("[DPID %s] handover: %s port %s -> %s", dpid, src, old_port, in_port)
             self.ho_start[(dpid, src)] = True
             self.delete_flows_for_mac(datapath, src)
+            # Cooperative signal: topology reads this to confirm Ryu detected
+            # the handover and can trigger a proactive cache warm for the new AP.
+            try:
+                with open('/tmp/ryu_coop_signal', 'a') as _sig:
+                    _sig.write('%.6f,%s,%s->%s\n' % (time.time(), dpid, old_port, in_port))
+            except Exception:
+                pass
 
         # ── ARP learning (ip_to_mac) ─────────────────────────
         arp_pkt = pkt.get_protocol(arp.arp)
