@@ -9,7 +9,7 @@ import os
 # OR "root" (nested sudo -- e.g. `sudo ./run_4rsu_multi.sh` wrapping an inner
 # `sudo python3 ...`, where the inner call's invoking user IS root) it falls
 # back to DEFAULT_USER instead, so paths never resolve to /root by accident.
-DEFAULT_USER = "diz"                     # <-- set to your username
+DEFAULT_USER = "pc1"                     # <-- set to your username
 _sudo_user = os.environ.get("SUDO_USER")
 USER = _sudo_user if (_sudo_user and _sudo_user != "root") else DEFAULT_USER
 
