@@ -13,8 +13,8 @@ USER = _sudo_user if (_sudo_user and _sudo_user != "root") else DEFAULT_USER
 HOME = "/home/%s" % USER
 
 # nginx video files directory (must contain Video.mp4 and Video2.mp4)
-CONTENT_DIR = os.path.join(HOME, "PSU_Project", "Dash-CDN-Project",
-                           "CDN", "origin")
+CONTENT_DIR = os.path.join(HOME, "Vault_PSU_Project", "wiki", "PSU_Project",
+                           "Dash-CDN-Project", "CDN", "origin")
 
 # nginx ports
 ORIGIN_PORT = 8080   # origin  (always MISS path — WAN delay applied)

@@ -18,10 +18,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-PROJECT="/home/kongpop/PSU_Project/Dash-CDN-Project"
+PROJECT="/home/kongpop/Vault_PSU_Project/wiki/PSU_Project/Dash-CDN-Project"
 BASELINE="$PROJECT/CDN_baseline"
 RYU_CTRL="$PROJECT/Ryu-SDN-Controller/cdn_switch_13.py"
-RYU_PYTHON="/home/kongpop/PSU_Project/mininet-wifi/ryu-venv/bin/python3.8"
+RYU_PYTHON="/home/kongpop/Vault_PSU_Project/wiki/PSU_Project/mininet-wifi/ryu-venv/bin/python3.8"
 RUN_ID="cdn_baseline_sdn_sit${SIT}_spd${SPEED}_r${ROUND}"
 OUT_DIR="$PROJECT/results/cdn_baseline/sdn/sit${SIT}/speed${SPEED}/${RUN_ID}"
 mkdir -p "$OUT_DIR"
@@ -29,6 +29,14 @@ mkdir -p "$OUT_DIR"
 echo "============================================================"
 echo "  CDN Baseline SDN RUN: $RUN_ID"
 echo "============================================================"
+
+# Preflight: vlc_player.py needs python-vlc — fail fast before burning a
+# full Ryu+mininet cycle (this script chains up to 60x via run_baseline_multi_sdn.sh)
+python3 -c "import vlc" 2>/dev/null || {
+    echo "[ERROR] python-vlc not installed. Run: pip3 install python-vlc"
+    echo "        (or: sudo apt install -y python3-vlc)"
+    exit 1
+}
 
 # Cleanup
 mn -c > /dev/null 2>&1 || true

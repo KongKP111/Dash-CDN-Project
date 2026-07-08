@@ -9,7 +9,7 @@ SIT_LIST=(1 2)
 SPEED_LIST=(20 25 30)
 ROUND_LIST=(1 2 3 4 5 6 7 8 9 10)
 RESUME=false
-PROJECT="/home/kongpop/PSU_Project/Dash-CDN-Project"
+PROJECT="/home/kongpop/Vault_PSU_Project/wiki/PSU_Project/Dash-CDN-Project"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

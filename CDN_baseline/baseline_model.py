@@ -12,12 +12,12 @@ of ABR bitrate selection.
 import math
 
 # ── Scenario constants ─────────────────────────────────────────────────────
-# 4 APs on a straight line, equally spaced at 0, 200, 400, 600 m
-# Vehicle travels from START_X to END_X at SPEED_MPS
-AP_POSITIONS = [0.0, 200.0, 400.0, 600.0]   # m
-AP_COVERAGE  = 150.0                          # m per AP (overlap at ±50m)
-START_X      = 0.0                            # m
-END_X        = 600.0                          # m
+# 4 APs on a straight line — same layout as DASH 4-RSU scenario
+# spacing 500 m, radius 300 m, overlap 100 m, START/END at coverage edge
+AP_POSITIONS = [0.0, 500.0, 1000.0, 1500.0]  # m  (matches DASH RSU_X)
+AP_COVERAGE  = 300.0                           # m per AP (overlap = 100 m)
+START_X      = -300.0                          # m  (AP1 coverage edge)
+END_X        = 1800.0                          # m  (AP4 coverage edge)
 SPEED_MPS    = {20: 20/3.6, 25: 25/3.6, 30: 30/3.6}   # km/h → m/s
 SAMPLE_DT    = 1.0                            # s
 

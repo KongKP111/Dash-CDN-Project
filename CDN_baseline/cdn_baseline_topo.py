@@ -423,9 +423,11 @@ class BaselineLivePlot:
     def setup(self, sit, speed_kmh):
         self.speed_kmh = speed_kmh
         plt.ion()
-        r    = self.coverage_m
-        xmin = self.ap_positions[0]  - r - 20
-        xmax = self.ap_positions[-1] + r + 20
+        r      = self.coverage_m
+        start_x = self.ap_positions[0] - r
+        end_x   = self.ap_positions[-1] + r
+        xmin = start_x - 20
+        xmax = end_x   + 20
         ymin = -r - 40
         ymax =  r + 70
         data_w = xmax - xmin
@@ -455,18 +457,20 @@ class BaselineLivePlot:
             ax.text(xpos, r + 8, 'AP%d (R=%dm)' % (i+1, int(r)),
                     ha='center', fontsize=9, fontweight='bold', color=color, zorder=6)
 
-        ax.text(self.ap_positions[0], -r - 18, 'START/END',
+        ax.text(start_x, -r - 18, 'START',
                 ha='center', fontsize=10, fontweight='bold')
-        ax.plot([self.ap_positions[0], self.ap_positions[-1]], [0, 0],
+        ax.text(end_x, -r - 18, 'END',
+                ha='center', fontsize=10, fontweight='bold')
+        ax.plot([start_x, end_x], [0, 0],
                 color='#1482c5', linewidth=2.5, alpha=0.4, label='Route', zorder=3)
 
         self.trav_line, = ax.plot([], [], color='orange', linewidth=3.0,
                                   zorder=4, label='Traversed')
-        self.car_marker = ax.scatter(self.ap_positions[0], 0,
+        self.car_marker = ax.scatter(start_x, 0,
                                      s=280, marker='v', color='black',
                                      zorder=7, label='Vehicle')
         self.info_text = ax.text(
-            0.02, 0.98, 't=0.0s | speed=0.00 km/h | AP=N/A | car=(0,0)',
+            0.02, 0.98, 't=0.0s | speed=0.00 km/h | AP=N/A | car=(%.0f,0)' % start_x,
             transform=ax.transAxes, verticalalignment='top',
             fontsize=10, bbox=dict(boxstyle='round', alpha=0.3), zorder=8)
         ax.text(0.01, 0.03, 'Coverage: 100% of route',
@@ -557,12 +561,11 @@ def topology(args):
         )
         aps.append(ap)
 
-    # car1 starts at x=10 (not x=0) so it is NOT exactly on top of ap1
-    # — avoids wmediumd pre-associating and getting stuck in "already connected"
-    info("*** Adding car1 (starting near ap1 but not on top of it)\n")
+    # car1 starts at START_X (coverage edge of AP1, same as DASH scenario)
+    info("*** Adding car1 (starting at AP1 coverage edge)\n")
     car1 = net.addStation(
         "car1", ip="10.0.0.1/8",
-        position="10,0,0", range=300)
+        position="%.1f,0,0" % M.START_X, range=int(M.AP_COVERAGE * 1.5))
 
     info("*** Adding server1 (origin + edge cache)\n")
     server = net.addHost("server1", ip="%s/8" % ORIGIN_IP)

@@ -15,6 +15,12 @@ Then:
   sudo python3 cdn_baseline_topo_sdn.py --sit 1 --speed 20 --round 1 --auto --no-gui
 
 Or use run_baseline_sdn.sh which handles Ryu startup automatically.
+
+Note: this script's own cleanup step (equivalent to `mn -c`, see
+mininet_cleanup_preserving_ryu()) deliberately does NOT kill ryu-manager,
+unlike plain `mn -c` — see that function's docstring for why. This is what
+makes starting Ryu manually via the plain `ryu-manager` command (above)
+safe to use directly, without needing a special invocation.
 """
 
 import os, re, sys, time, argparse
@@ -47,6 +53,8 @@ EDGE_IP     = config.EDGE_IP
 ORIGIN_PORT = config.ORIGIN_PORT
 EDGE_PORT   = config.EDGE_PORT
 VIDEO       = {1: config.VIDEO_HIT, 2: config.VIDEO_MISS}
+
+VLC_PLAYER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vlc_player.py')
 
 HANDOVER_SETTLE_TIME = 0.60
 
@@ -108,6 +116,117 @@ def _wait_for_coop_warm(server, ap_idx, timeout_s=15):
         time.sleep(1)
     info('*** [SDN-COOP] edge%d warm timed out after %ds\n' % (ap_idx + 1, timeout_s))
     return False
+
+
+def _vlc_paths(out_dir, run_id):
+    """Shared path convention for the VLC control file + telemetry outputs
+    of one run — used by vlc_start()/vlc_switch()/vlc_stop()."""
+    return {
+        'ctrl':  '/tmp/cdn_vlc_ctrl_%s' % run_id,
+        'tel':   os.path.join(out_dir, 'vlc_playback_%s.csv' % run_id),
+        'evt':   os.path.join(out_dir, 'vlc_events_%s.csv' % run_id),
+        'log':   '/tmp/vlc_%s.log' % run_id,
+    }
+
+
+def vlc_start(car1, out_dir, run_id, initial_url, show=False):
+    """Launch vlc_player.py inside car1's netns for real playback + buffer/
+    stall telemetry, alongside (not instead of) the existing curl-based
+    measure_cdn() HIT/MISS probe. Mininet hosts share the real filesystem
+    (only network namespaces differ — see PingLossPoller's use of
+    /tmp/cdn_baseline_ping.log for the same pattern), so the ctrl file and
+    CSV outputs are directly readable/writable from either side.
+
+    show=True opens a real video window (manual/demo runs only — never
+    set from run_baseline_sdn.sh/run_baseline_multi_sdn.sh, which stay
+    headless). Needs a reachable X display: the DISPLAY this process was
+    launched with is forwarded verbatim, and the target X server must
+    already trust this process's user (typically root, since this script
+    runs under sudo) — e.g. `xhost +si:localuser:root` run once beforehand
+    in the owning desktop session. That xhost call is a local X11
+    access-control change with real (if narrow) security implications, so
+    it's left as a manual step for you to opt into, not something this
+    script does automatically.
+    """
+    paths = _vlc_paths(out_dir, run_id)
+    car1.cmd("pkill -f vlc_player.py 2>/dev/null; true")
+    if os.path.exists(paths['ctrl']):
+        os.remove(paths['ctrl'])
+    show_flag = '--show' if show else ''
+    env_prefix = 'DISPLAY=%s ' % os.environ['DISPLAY'] if show and os.environ.get('DISPLAY') else ''
+    if show and not os.environ.get('DISPLAY'):
+        info('*** [VLC] WARNING: --vlc-show requested but no DISPLAY set in this '
+             'shell — the video window will likely fail to open\n')
+    info('*** [VLC] Starting real playback on car1%s: %s\n'
+         % (' (with video window)' if show else '', initial_url))
+    car1.cmd(
+        '%spython3 %s --run-id %s --initial-ap 1 --initial-url %s '
+        '--ctrl-file %s --telemetry-csv %s --events-csv %s %s '
+        '> %s 2>&1 &'
+        % (env_prefix, VLC_PLAYER_SCRIPT, run_id, initial_url,
+           paths['ctrl'], paths['tel'], paths['evt'], show_flag, paths['log'])
+    )
+    time.sleep(0.3)
+    return paths
+
+
+def vlc_switch(car1, paths, ap_idx, url):
+    """Signal vlc_player.py (via the atomic ctrl-file write convention) to
+    switch to the new edge's URL. vlc_player.py itself captures/restores
+    playback position — this call does not compute or pass position."""
+    tmp = paths['ctrl'] + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write('%d|%s\n' % (ap_idx + 1, url))
+    os.replace(tmp, paths['ctrl'])
+
+
+def vlc_stop(car1):
+    """Graceful SIGTERM so vlc_player.py flushes its CSVs before exiting."""
+    car1.cmd("pkill -TERM -f vlc_player.py 2>/dev/null; true")
+    time.sleep(0.5)
+
+
+def mininet_cleanup_preserving_ryu():
+    """Equivalent to shelling out to `mn -c`, except it does NOT kill any
+    process named "ryu-manager".
+
+    `mn -c` (the mininet-wifi `mn` CLI's --clean flag) runs two things in
+    sequence: `mininet.clean.cleanup()` then `mn_wifi.clean.cleanup_wifi()`
+    (confirmed by reading the installed `mn` script directly). Only the
+    first one is the problem: `mininet.clean.Cleanup.cleanup()` hardcodes
+    a `killall controller ofprotocol ... ryu-manager` call as part of
+    "removing excess controllers" — which matches (and kills) any process
+    whose comm name is literally "ryu-manager", i.e. exactly what running
+    the plain `ryu-manager` command produces. Since this script always ran
+    that cleanup as its first action, it was killing a manually-started
+    Ryu controller the instant it launched — confirmed empirically.
+
+    Fix: call `mininet.clean.cleanup()` directly (not via `os.system('mn -c')`)
+    with its own `sh()` helper temporarily wrapped to strip "ryu-manager"
+    out of any `killall` command before it runs, then call
+    `mn_wifi.clean.cleanup_wifi()` unchanged (it never touches ryu-manager
+    at all — confirmed by reading its source). Every other part of the
+    normal `mn -c` cleanup (stale OVS bridges/datapaths, /tmp junk, X11
+    tunnels, mac80211_hwsim, wmediumd, hostapd, etc.) still runs exactly
+    as before.
+    """
+    import mininet.clean as _clean
+    import mn_wifi.clean as _clean_wifi
+
+    orig_sh = _clean.sh
+
+    def _sh_preserving_ryu(cmd):
+        if 'killall' in cmd and 'ryu-manager' in cmd:
+            cmd = cmd.replace('ryu-manager', '')
+        return orig_sh(cmd)
+
+    _clean.sh = _sh_preserving_ryu
+    try:
+        _clean.cleanup()
+    finally:
+        _clean.sh = orig_sh
+
+    _clean_wifi.cleanup_wifi()
 
 
 def ensure_assoc_sdn(car1, ap, ap_idx, retries=8, wait=1.0):
@@ -177,8 +296,8 @@ def topology(args):
     info('  Speed: %d km/h (%.3f m/s)\n' % (speed_kmh, speed_mps))
     info('=' * 60 + '\n')
 
-    info('*** Cleaning up leftover Mininet state\n')
-    os.system('mn -c > /dev/null 2>&1')
+    info('*** Cleaning up leftover Mininet state (preserving any running Ryu controller)\n')
+    mininet_cleanup_preserving_ryu()
     time.sleep(1)
 
     net = Mininet_wifi(link=wmediumd, wmediumd_mode=interference)
@@ -205,10 +324,10 @@ def topology(args):
     info('*** Adding central switch s1\n')
     s1 = net.addSwitch('s1', protocols='OpenFlow13')
 
-    # car1 starts at x=10 (not x=0) — avoids wmediumd pre-associating and getting stuck
-    info('*** Adding car1 (starting near ap1 but not on top of it)\n')
+    # car1 starts at START_X (coverage edge of AP1, same as DASH scenario)
+    info('*** Adding car1 (starting at AP1 coverage edge)\n')
     car1 = net.addStation('car1', ip='10.0.0.1/8',
-                          position='10,0,0', range=300)
+                          position='%.1f,0,0' % M.START_X, range=int(M.AP_COVERAGE * 1.5))
 
     info('*** Adding server1 (origin + edge cache)\n')
     server = net.addHost('server1', ip='%s/8' % ORIGIN_IP)
@@ -272,7 +391,7 @@ def topology(args):
             pass
         time.sleep(0.8)
         car1.cmd('ping -c 1 -W 1 %s > /dev/null 2>&1' % ORIGIN_IP)
-    car1.setPosition('10,0,0')
+    car1.setPosition('%.1f,0,0' % M.START_X)
     time.sleep(0.5)
     info('*** [WARMUP] Done — Ryu flow rules primed\n')
 
@@ -296,20 +415,26 @@ def topology(args):
     set_tc(server, srv_if, boot_bw)
     info('*** Bootstrap BW: %.2f Mbps\n' % boot_bw)
 
-    # ── SDN cooperative: prime AP1 edge BEFORE WAN delay (sit 1 only) ────
+    # ── SDN cooperative: prime ALL 4 edges BEFORE WAN delay (sit 1 only) ──
+    # Video.mp4 is "popular" content — a real CDN would already have it
+    # distributed to every edge PoP, not just the vehicle's starting zone.
+    # Safe to warm all 4 before the WAN-delay tc rule below: edge1 proxies
+    # to origin (fast, pre-WAN-delay) and edge2-4 proxy to edge1 over
+    # loopback (cooperative_warm()), never touching origin/WAN delay either.
     # sit 2 = unpopular content (Video2.mp4, min_uses=1000) — never cached,
     # cooperative warm must NOT run or it would bypass min_uses via /coop_warm/.
     if sit == 1:
-        info('*** [SDN-COOP] Pre-warming edge1 (AP1) before WAN delay...\n')
-        cooperative_warm(server, 0, VIDEO[sit], block=True)
-        warm_check = server.cmd(
-            'curl -s -o /dev/null -r 0-65535 -D - --max-time 10 '
-            'http://127.0.0.1:%d/%s | grep -i X-Cache-Status'
-            % (EDGE_PORTS[0], VIDEO[sit])
-        ).strip()
-        info('*** edge1 warm status: %s\n' % warm_check)
-        if 'HIT' not in warm_check.upper():
-            info('*** WARNING: edge1 not HIT after pre-warm\n')
+        info('*** [SDN-COOP] Pre-warming all 4 edges (popular content) before WAN delay...\n')
+        for warm_idx in range(4):
+            cooperative_warm(server, warm_idx, VIDEO[sit], block=True)
+            warm_check = server.cmd(
+                'curl -s -o /dev/null -r 0-65535 -D - --max-time 10 '
+                'http://127.0.0.1:%d/%s | grep -i X-Cache-Status'
+                % (EDGE_PORTS[warm_idx], VIDEO[sit])
+            ).strip()
+            info('*** edge%d warm status: %s\n' % (warm_idx + 1, warm_check))
+            if 'HIT' not in warm_check.upper():
+                info('*** WARNING: edge%d not HIT after pre-warm\n' % (warm_idx + 1))
     else:
         info('*** [SDN-COOP] sit 2 — skipping cooperative warm (unpopular content)\n')
 
@@ -343,6 +468,7 @@ def topology(args):
     car1.cmd("pkill -f 'ping -i 0.05' 2>/dev/null")
     car1.cmd('ping -i 0.05 -O %s > /tmp/cdn_baseline_ping.log 2>&1 &' % ORIGIN_IP)
     loss_probe = PingLossPoller()
+    car1.cmd("pkill -f vlc_player.py 2>/dev/null; true")  # clear any stale process from a crashed prior run
 
     # ── Register mobility starter ──────────────────────────────────────────
     def start_mobility():
@@ -363,6 +489,7 @@ def topology(args):
 
     # ── Cleanup ────────────────────────────────────────────────────────────
     car1.cmd("pkill -f 'ping -i 0.05' 2>/dev/null")
+    car1.cmd("pkill -TERM -f vlc_player.py 2>/dev/null")  # safety net for non-auto/CLI exit
     server.cmd('pkill -f nginx_baseline 2>/dev/null')
     if live_plot:
         live_plot.close()
@@ -389,6 +516,12 @@ def run_loop_sdn(car1, server, srv_if, aps, video_file, sit,
 
         info('*** Drive %.0f→%.0f m @ %.1f km/h (%.0fs total)\n'
              % (M.START_X, M.END_X, speed_kmh, total))
+
+        out_dir = os.path.dirname(out_csv)
+        vlc_paths = vlc_start(
+            car1, out_dir, run_id,
+            'http://%s:%d/%s' % (EDGE_IP, EDGE_PORTS[0], video_file),
+            show=args.vlc_show)
 
         t_start = time.monotonic()
 
@@ -429,6 +562,8 @@ def run_loop_sdn(car1, server, srv_if, aps, video_file, sit,
                     time.sleep(HANDOVER_SETTLE_TIME)
                     if do_coop:
                         _wait_for_coop_warm(server, ap_idx)
+                    vlc_switch(car1, vlc_paths, ap_idx,
+                               'http://%s:%d/%s' % (EDGE_IP, EDGE_PORTS[ap_idx], video_file))
                 total_paused += time.monotonic() - ho_start
                 prev_ap = ap_idx
             else:
@@ -470,9 +605,12 @@ def run_loop_sdn(car1, server, srv_if, aps, video_file, sit,
             if remaining > 0.05:
                 time.sleep(remaining)
 
+    vlc_stop(car1)
     ho_csv.close()
     info('*** CSV saved: %s\n' % out_csv)
     info('*** Topology handover log: %s\n' % ho_csv_path)
+    info('*** VLC playback telemetry: %s\n' % vlc_paths['tel'])
+    info('*** VLC events log: %s\n' % vlc_paths['evt'])
 
 
 if __name__ == '__main__':
@@ -484,6 +622,11 @@ if __name__ == '__main__':
                    default='/tmp/cdn_baseline_sdn_results')
     p.add_argument('--auto',    action='store_true')
     p.add_argument('--no-gui',  action='store_true')
+    p.add_argument('--vlc-show', action='store_true',
+                    help='Open a real video window for the VLC playback '
+                         '(manual/demo runs only — needs a reachable X '
+                         'display; run_baseline_sdn.sh never passes this, '
+                         'batch runs stay headless).')
     args = p.parse_args()
     setLogLevel('info')
     topology(args)

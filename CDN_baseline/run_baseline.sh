@@ -15,7 +15,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-PROJECT="/home/kongpop/PSU_Project/Dash-CDN-Project"
+PROJECT="/home/kongpop/Vault_PSU_Project/wiki/PSU_Project/Dash-CDN-Project"
 BASELINE="$PROJECT/CDN_baseline"
 RUN_ID="cdn_baseline_sit${SIT}_spd${SPEED}_r${ROUND}"
 OUT_DIR="$PROJECT/results/cdn_baseline/no_sdn/sit${SIT}/speed${SPEED}/${RUN_ID}"
