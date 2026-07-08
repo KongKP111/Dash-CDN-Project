@@ -34,7 +34,12 @@ Run:
 import os, re, sys, time, argparse, types
 from mininet.log import setLogLevel, info
 import matplotlib
-matplotlib.use('TkAgg')
+try:
+    matplotlib.use('TkAgg')
+except ImportError:
+    # No X display available (e.g. headless SSH session) — fall back to a
+    # non-interactive backend so the run continues without a live plot.
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from mn_wifi.net import Mininet_wifi
@@ -63,6 +68,7 @@ HANDOVER_SETTLE_TIME = 0.60   # same as CDN main
 
 # ── nginx config templates ─────────────────────────────────────────────────
 NGINX_ORIGIN_CONF = """
+user {nginx_user};
 worker_processes 1;
 pid /tmp/nginx_cdn_baseline_origin.pid;
 error_log /tmp/nginx_baseline_origin_err.log;
@@ -89,6 +95,7 @@ http {{
 # rewrite strips /coop_warm so $uri = /{file}, same cache key as regular
 # location → car1's GET /{file} finds the staged cache entry → HIT.
 NGINX_EDGE_CONF_TMPL = """
+user {nginx_user};
 worker_processes 1;
 pid /tmp/nginx_baseline_edge{n}.pid;
 error_log /tmp/nginx_baseline_edge{n}_err.log;
@@ -159,7 +166,7 @@ def write_nginx_configs(server):
     so car1 always sees HIT.
     """
     origin_conf = NGINX_ORIGIN_CONF.format(
-        origin_port=ORIGIN_PORT, content_dir=CONTENT_DIR)
+        origin_port=ORIGIN_PORT, content_dir=CONTENT_DIR, nginx_user=USER)
     with open("/tmp/nginx_baseline_origin.conf", "w") as f:
         f.write(origin_conf)
 
@@ -182,7 +189,8 @@ def write_nginx_configs(server):
         # edge1 → origin (before WAN delay is active); edge2/3/4 → edge1 (P2P)
         coop_upstream = ORIGIN_PORT if n == 1 else EDGE_PORTS[0]
         edge_conf = NGINX_EDGE_CONF_TMPL.format(
-            n=n, port=port, origin_port=ORIGIN_PORT, coop_upstream=coop_upstream)
+            n=n, port=port, origin_port=ORIGIN_PORT, coop_upstream=coop_upstream,
+            nginx_user=USER)
         conf_path = "/tmp/nginx_baseline_edge%d.conf" % n
         with open(conf_path, "w") as f:
             f.write(edge_conf)

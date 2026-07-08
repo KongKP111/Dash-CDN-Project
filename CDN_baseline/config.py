@@ -5,7 +5,7 @@ Mirrors dash-baseline/config.py structure for fair comparison.
 """
 import os
 
-DEFAULT_USER = "kongpop"
+DEFAULT_USER = "pc1"
 _sudo_user = os.environ.get("SUDO_USER") or ""
 # When nested sudo is used (e.g. sudo bash script.sh → sudo python3),
 # SUDO_USER becomes "root". Fall back to DEFAULT_USER in that case.
@@ -13,8 +13,7 @@ USER = _sudo_user if (_sudo_user and _sudo_user != "root") else DEFAULT_USER
 HOME = "/home/%s" % USER
 
 # nginx video files directory (must contain Video.mp4 and Video2.mp4)
-CONTENT_DIR = os.path.join(HOME, "Vault_PSU_Project", "wiki", "PSU_Project",
-                           "Dash-CDN-Project", "CDN", "origin")
+CONTENT_DIR = os.path.join(HOME, "sdn-cdn-dash-research", "CDN", "origin")
 
 # nginx ports
 ORIGIN_PORT = 8080   # origin  (always MISS path — WAN delay applied)

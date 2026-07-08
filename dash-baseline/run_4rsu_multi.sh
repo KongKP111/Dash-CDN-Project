@@ -3,7 +3,10 @@
 # between runs. Starts (or reuses) a long-running Ryu controller container;
 # `sudo mn -c` never touches it (--network host, separate process).
 #
-#   ./run_4rsu_multi.sh 10 results_4rsu
+#   ./run_4rsu_multi.sh 10 results_4rsu step2h
+#
+# 3rd arg is the RSSI->bandwidth mapping (--bw-mapping): linear (default,
+# unchanged behavior if omitted) | step | step2 | step2h.
 #
 # Each run is tagged with its run_id (run_01, run_02, ...) via
 # /tmp/current_run_id.txt, written by baseline_4rsu_topo.py itself -- the
@@ -12,6 +15,7 @@
 set -u
 N=${1:-10}
 OUTDIR=${2:-results_4rsu}
+BW_MAPPING=${3:-linear}
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CTRL_FILE="$SCRIPT_DIR/../Ryu-SDN-Controller/sdn_controller.py"
 cd "$SCRIPT_DIR"
@@ -39,7 +43,7 @@ for i in $(seq 1 "$N"); do
     run=$(printf "run_%02d" "$i")
     echo "================  $run  /  $N  ================"
     sudo mn -c >/dev/null 2>&1
-    sudo python3 baseline_4rsu_topo.py --headless --run-id "$run" --out "$OUTDIR/$run.csv"
+    sudo python3 baseline_4rsu_topo.py --headless --bw-mapping "$BW_MAPPING" --run-id "$run" --out "$OUTDIR/$run.csv"
     # belt-and-suspenders: the topology script force-kills its own vlc/Xvfb,
     # but confirm nothing survived before the next run starts.
     pkill -9 -u "$USER" -f 'vlc -I dummy' 2>/dev/null

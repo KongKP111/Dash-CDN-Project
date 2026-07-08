@@ -25,10 +25,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-PROJECT="/home/kongpop/Vault_PSU_Project/wiki/PSU_Project/Dash-CDN-Project"
+PROJECT="/home/pc1/sdn-cdn-dash-research"
 BASELINE="$PROJECT/CDN_baseline"
 RYU_CTRL="$PROJECT/Ryu-SDN-Controller/cdn_switch_13.py"
-RYU_PYTHON="/home/kongpop/Vault_PSU_Project/wiki/PSU_Project/mininet-wifi/ryu-venv/bin/python3.8"
+RYU_PYTHON="/usr/bin/python3"
 
 start_ryu() {
     local run_id="$1"
