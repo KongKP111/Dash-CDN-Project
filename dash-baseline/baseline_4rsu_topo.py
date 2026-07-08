@@ -30,6 +30,12 @@ Run (headless, unattended):
   cd ~/sdn-cdn-dash-research/dash-baseline
   sudo python3 baseline_4rsu_topo.py --headless --run-id run_01
   python3 plot_4rsu_run.py baseline_4rsu_run.csv
+
+RSSI->bandwidth mapping (--bw-mapping, default "linear"): pass "step" to use
+the discrete-tier profile in baseline_model.py instead of the original
+continuous ramp (closer to how real 802.11 rate adaptation behaves) --
+everything else (topology, mobility, VLC, content) stays identical, so
+"linear" vs "step" batches are directly comparable.
 """
 
 import os
@@ -154,8 +160,15 @@ def topology(args):
     with open(RUN_ID_FILE, "w") as f:
         f.write(args.run_id)
 
+    # --vlc-verbose: diagnostic only, off by default so normal/batch runs are
+    # unaffected. Adds -vvv so VLC's adaptive-demux module logs its actual
+    # representation-switch decisions to /tmp/vlc.log (does NOT touch the
+    # bandwidth model, ABR thresholds, or anything else experimental).
+    verbose_flag = "-vvv " if args.vlc_verbose else ""
+
     if args.headless:
-        info("*** Launching VLC headless (xvfb) as user '%s'\n" % USER)
+        info("*** Launching VLC headless (xvfb) as user '%s'%s\n"
+             % (USER, " [verbose]" if args.vlc_verbose else ""))
         # -extension GLX (Xvfb) + --avcodec-hw=none/--vout=x11 (VLC): this
         # machine has an NVIDIA GPU whose nouveau driver hangs (D-state,
         # unkillable even by SIGKILL) if VLC's video output probes GLX/DRI.
@@ -164,16 +177,17 @@ def topology(args):
         car1.cmd("sudo -u %s env HOME=%s "
                  "xvfb-run -a --server-args='-screen 0 1280x1024x24 -ac -extension GLX' "
                  "vlc -I dummy --no-audio --avcodec-hw=none --vout=x11 --play-and-exit "
-                 "--adaptive-logic=rate --network-caching=3000 "
+                 "%s--adaptive-logic=rate --network-caching=3000 "
                  "'http://%s:%d/index.mpd' >/tmp/vlc.log 2>&1 &"
-                 % (USER, HOME, SRV_IP, SRV_PORT))
+                 % (USER, HOME, verbose_flag, SRV_IP, SRV_PORT))
     else:
-        info("*** Launching VLC as user '%s' (popup)\n" % USER)
+        info("*** Launching VLC as user '%s' (popup)%s\n"
+             % (USER, " [verbose]" if args.vlc_verbose else ""))
         car1.cmd("sudo -u %s env DISPLAY=:0 HOME=%s "
                  "vlc --no-qt-privacy-ask --no-video-title-show "
-                 "--adaptive-logic=rate --network-caching=3000 "
+                 "%s--adaptive-logic=rate --network-caching=3000 "
                  "'http://%s:%d/index.mpd' >/tmp/vlc.log 2>&1 &"
-                 % (USER, HOME, SRV_IP, SRV_PORT))
+                 % (USER, HOME, verbose_flag, SRV_IP, SRV_PORT))
 
     info("*** Warmup %ds (let VLC buffer)\n" % args.warmup)
     time.sleep(args.warmup)
@@ -205,8 +219,13 @@ def run_loop(car1, server1, srv_if, aps, args):
     t = 0.0
     x = M4.START_X
     total = (M4.END_X - M4.START_X) / M4.SPEED_MPS
-    info("*** Driving %d->%d m @ %.2f m/s (%.0fs), 4 RSUs\n"
-         % (M4.START_X, M4.END_X, M4.SPEED_MPS, total))
+    info("*** Driving %d->%d m @ %.2f m/s (%.0fs), 4 RSUs, bw-mapping=%s\n"
+         % (M4.START_X, M4.END_X, M4.SPEED_MPS, total, args.bw_mapping))
+
+    # step2h is stateful (Schmitt-trigger dead-band around each step2
+    # boundary) -- instantiate once per run, everything else stays a plain
+    # per-sample function call via M4.throughput_from_rssi().
+    hyst_mapper = M.Step2HysteresisMapper() if args.bw_mapping == "step2h" else None
 
     cur_rsu = 0   # car1 already associated to aps[0] before warmup
     n_handovers = 0
@@ -237,7 +256,10 @@ def run_loop(car1, server1, srv_if, aps, args):
         if rssi is None:
             rssi = M4.rssi_from_distance(d); src = "model"
 
-        bw = M4.throughput_from_rssi(rssi)
+        if hyst_mapper is not None:
+            bw = hyst_mapper.update(rssi)
+        else:
+            bw = M4.throughput_from_rssi(rssi, mode=args.bw_mapping)
         set_tc(server1, srv_if, bw)
 
         qidx, seg, n_new = poller.poll()
@@ -279,6 +301,22 @@ if __name__ == "__main__":
     p.add_argument("--run-id", dest="run_id", default="run_01",
                    help="tag written to %s so the Ryu controller attributes "
                         "handover_times.csv rows to this run" % RUN_ID_FILE)
+    p.add_argument("--vlc-verbose", dest="vlc_verbose", action="store_true",
+                   help="add -vvv to the VLC command so its adaptive-demux "
+                        "module logs representation-switch decisions to "
+                        "/tmp/vlc.log -- diagnostic only, off by default, "
+                        "does not touch the bandwidth model or ABR logic")
+    p.add_argument("--bw-mapping", dest="bw_mapping", default="linear",
+                   choices=["linear", "step", "step2", "step2h"],
+                   help="RSSI->bandwidth mapping: 'linear' (original, "
+                        "continuous ramp), 'step' (discrete tiers on equal "
+                        "RSSI steps -- narrow near the RSU), 'step2' "
+                        "(discrete tiers on equal DISTANCE bands, >=18s "
+                        "dwell per tier), or 'step2h' (step2 + Schmitt-"
+                        "trigger hysteresis around each boundary, damps "
+                        "switches caused by live RSSI jitter at an edge) "
+                        "-- see baseline_model.py imposed_bandwidth() / "
+                        "Step2HysteresisMapper")
     args = p.parse_args()
     setLogLevel("info")
     topology(args)
