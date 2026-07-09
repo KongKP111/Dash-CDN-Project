@@ -10,11 +10,14 @@ Usage:
     python3 dash_cdn_comparison.py --out /custom/path
 """
 
-import csv, os, argparse
+import csv, os, sys, argparse
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import baseline_model as M
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -40,10 +43,15 @@ MIDPOINT = [
     (RSU_X[i] + RSU_X[i+1]) / 2 for i in range(len(RSU_X) - 1)
 ]
 
-# QoE utility (mirrors baseline_model.py)
-_DASH_UTIL     = {"360p": 1.5, "720p": 3.5, "1080p": 5.0}
-_SWITCH_PENALTY = 0.6
-_REBUFFER_FLOOR = 1.0
+# QoE (Yin et al., SIGCOMM'15 linear model — see TEAMMATE_SETUP.md #5):
+#   QoE = sum(q(R_k)) - mu * sum(|q(R_k+1) - q(R_k)|) - sum(T_k)
+# q(R_k) = bitrate (Mbps) of the rendition, NOT the old toy 1-5 MOS scale.
+# mu=1 (standard default). T_k = rebuffer seconds before segment k, taken
+# directly from the 'stall' flag (each row is one SAMPLE_DT=1s tick, and
+# RebufferEstimator sets stall=1 exactly when that whole tick was a
+# buffer underrun — see dash-baseline/baseline_topo.py).
+_BITRATE_MBPS = {"360p": 1.0, "720p": 2.5, "1080p": 5.0}
+_MU = 1.0
 
 # ── Style ──────────────────────────────────────────────────────────────────
 plt.rcParams.update({
@@ -70,17 +78,17 @@ def col(rows, key, cast=float):
     return [cast(r[key]) for r in rows]
 
 def compute_dash_qoe(rows):
-    qoes, prev_q = [], None
+    """Per-row Yin et al. QoE term: q(R_k) - mu*|q(R_k)-q(R_k-1)| - T_k.
+    Summing the returned list gives the run's total QoE from the formula;
+    plotted as-is it's the per-sample QoE contribution over position/time."""
+    qoes, prev_bitrate = [], None
     for r in rows:
-        if int(r.get('stall', 0)):
-            qoes.append(_REBUFFER_FLOOR)
-            prev_q = r['quality']
-            continue
-        val = _DASH_UTIL.get(r['quality'], 1.5)
-        if prev_q is not None and r['quality'] != prev_q:
-            val -= _SWITCH_PENALTY
-        qoes.append(max(1.0, min(5.0, val)))
-        prev_q = r['quality']
+        bitrate = _BITRATE_MBPS.get(r['quality'], 0.0)
+        switch_penalty = (_MU * abs(bitrate - prev_bitrate)
+                           if prev_bitrate is not None else 0.0)
+        rebuf_s = float(r.get('stall', 0))
+        qoes.append(bitrate - switch_penalty - rebuf_s)
+        prev_bitrate = bitrate
     return qoes
 
 def zone_spans(xmin, xmax):
@@ -120,7 +128,7 @@ def make_plot(sit, spd, dash_csv, cdn_csv, out_root):
     rssi_c  = col(rc, 'rssi')
     bw_c    = col(rc, 'bw_mbps')
     loss_c  = col(rc, 'loss_pct')
-    qoe_c   = col(rc, 'qoe')
+    qoe_c   = M.compute_cdn_qoe(rc)
     ho_xc   = [float(r['x']) for r in rc if int(r.get('handover', 0))]
 
     xmin = min(min(xd), min(xc))

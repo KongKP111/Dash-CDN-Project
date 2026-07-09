@@ -12,6 +12,7 @@ AStream/
 # Experiment outputs
 results/
 results_raw/
+result_multi_car/
 logs/
 *.log
 

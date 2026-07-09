@@ -65,6 +65,14 @@ VIDEO = {1: config.VIDEO_HIT, 2: config.VIDEO_MISS}
 
 HANDOVER_SETTLE_TIME = 0.60   # same as CDN main
 
+# small buffer over the nominal coverage radius, matching
+# dash-baseline/baseline_4rsu_topo.py's RANGE_M exactly. Previously this was
+# AP_COVERAGE*1.5 (450m on a 500m AP spacing -- 400m of overlap between
+# neighbouring APs, vs. DASH's 200m), which drowned out each AP's own
+# signal in interference from its neighbours and was the real reason live
+# RSSI never peaked near AP2/AP3/AP4 even after the per-AP SSID fix.
+AP_RANGE_M = int(M.AP_COVERAGE) + 50
+
 
 # ── nginx config templates ─────────────────────────────────────────────────
 NGINX_ORIGIN_CONF = """
@@ -239,6 +247,24 @@ def set_tc(server, iface, mbit):
 
 
 # ── Packet loss probe ──────────────────────────────────────────────────────
+def parse_rssi(output):
+    """Parse `iw dev ... link` output for the live signal strength — identical
+    to dash-baseline/baseline_topo.py::parse_rssi(), so both arms prefer the
+    same real measurement (with the same model fallback) instead of CDN
+    silently only ever using the synthetic model (TEAMMATE_SETUP.md fairness
+    checklist: same imposed-bandwidth stimulus, driven by the same signal)."""
+    m = re.search(r"signal:\s*(-?\d+)\s*dBm", output)
+    if not m:
+        return None
+    try:
+        v = int(m.group(1))
+    except ValueError:
+        return None
+    if v > 0 or v < -100:
+        return None
+    return float(v)
+
+
 class PingLossPoller:
     """ICMP loss probe — identical to DASH baseline."""
     LOG = "/tmp/cdn_baseline_ping.log"
@@ -255,6 +281,38 @@ class PingLossPoller:
         if tot == 0: return self.last
         self.last = 100.0 * lost / tot
         return self.last
+
+
+class VlcTelemetryPoller:
+    """Poll vlc_player.py's growing telemetry CSV (see vlc_start()) the same
+    incremental-byte-offset way PingLossPoller/QualityPoller poll their own
+    growing log files. Surfaces the REAL libvlc-measured buffering state for
+    this tick -- genuinely comparable to DASH's client-side
+    RebufferEstimator, instead of inferring "stall" purely from HTTP
+    latency."""
+    def __init__(self, tel_csv_path):
+        self.path = tel_csv_path
+        self.off = 0
+        self.is_stalling = False
+        self.buffer_pct = 100.0
+        self.cum_stall_s = 0.0
+
+    def poll(self):
+        try:
+            with open(self.path) as f:
+                f.seek(self.off); new = f.read(); self.off = f.tell()
+        except FileNotFoundError:
+            return self.is_stalling, self.buffer_pct, self.cum_stall_s
+        last_row = None
+        for line in new.splitlines():
+            if not line or line.startswith('t_epoch'):
+                continue
+            last_row = line.split(',')
+        if last_row and len(last_row) >= 11:
+            self.is_stalling = bool(int(last_row[7]))
+            self.buffer_pct = float(last_row[8])
+            self.cum_stall_s = float(last_row[10])
+        return self.is_stalling, self.buffer_pct, self.cum_stall_s
 
 
 # ── CDN measurement ────────────────────────────────────────────────────────
@@ -559,11 +617,15 @@ def topology(args):
     for i, xpos in enumerate(M.AP_POSITIONS):
         ap = net.addAccessPoint(
             "ap%d" % (i+1),
-            ssid    = "cdn-baseline",
+            # unique SSID per AP, matching dash-baseline's RSU_SSIDS pattern
+            # -- all 4 APs sharing one SSID confused wmediumd's live-RSSI
+            # tracking after the first handover (see cdn_baseline_topo_sdn.py
+            # for the full finding/comparison against DASH's own live-RSSI).
+            ssid    = "cdn-ap%d" % (i+1),
             mode    = "g",
             channel = str([1, 6, 11, 3][i]),   # non-overlapping channels
             position= "%.1f,0,0" % xpos,
-            range   = int(M.AP_COVERAGE * 1.5),
+            range   = AP_RANGE_M,
             failMode= "standalone",
             cls     = OVSKernelAP,
         )
@@ -573,7 +635,7 @@ def topology(args):
     info("*** Adding car1 (starting at AP1 coverage edge)\n")
     car1 = net.addStation(
         "car1", ip="10.0.0.1/8",
-        position="%.1f,0,0" % M.START_X, range=int(M.AP_COVERAGE * 1.5))
+        position="%.1f,0,0" % M.START_X, range=AP_RANGE_M)
 
     info("*** Adding server1 (origin + edge cache)\n")
     server = net.addHost("server1", ip="%s/8" % ORIGIN_IP)
@@ -708,9 +770,14 @@ def run_loop(car1, server, srv_if, aps, video_file,
     sit       = args.sit
     speed_kmh = args.speed
 
+    # No 'qoe' column here on purpose -- QoE is derived post-hoc from these
+    # raw signals (see baseline_model.compute_cdn_qoe()), same as the DASH
+    # arm's raw CSV never bakes in a qoe value either. That way a formula
+    # change (mu, thresholds, ...) never requires re-running the experiment
+    # -- just recompute from the CSV already on disk.
     with open(out_csv, "w") as f:
-        f.write("t,x,ap,rssi,bw_mbps,cache,latency_s,"
-                "speed_bps,loss_pct,qoe,handover,vehicle_speed_kmh\n")
+        f.write("t,x,dist,ap,rssi,rssi_src,bw_mbps,cache,latency_s,"
+                "speed_bps,loss_pct,stall,handover,vehicle_speed_kmh\n")
 
         prev_ap      = -1
         total_paused = 0.0   # seconds spent in handover — excluded from x calc
@@ -718,6 +785,11 @@ def run_loop(car1, server, srv_if, aps, video_file,
 
         info("*** Drive %.0f→%.0f m @ %.1f km/h (%.0fs total)\n"
              % (M.START_X, M.END_X, speed_kmh, total))
+
+        # step2h is stateful (Schmitt-trigger dead-band around each step2
+        # boundary) -- instantiate once per run, same pattern as
+        # dash-baseline/baseline_4rsu_topo.py so both arms share the mapper.
+        hyst_mapper = M.Step2HysteresisMapper() if args.bw_mapping == "step2h" else None
 
         # Wall-clock with pause: x = (elapsed - paused) × speed_mps
         # During handover we accumulate total_paused so the vehicle does NOT
@@ -734,10 +806,15 @@ def run_loop(car1, server, srv_if, aps, video_file,
             car1.setPosition("%.1f,0,0" % x)
             time.sleep(0.05)
 
-            # Nearest AP + RSSI
+            # Nearest AP + RSSI (prefer live, fall back to model — same
+            # pattern as dash-baseline/baseline_4rsu_topo.py's parse_rssi())
             ap_idx = M.nearest_ap_index(x)
             d      = abs(x - M.AP_POSITIONS[ap_idx])
-            rssi   = M.rssi_from_distance(d)
+            rssi   = parse_rssi(car1.cmd("iw dev car1-wlan0 link"))
+            rssi_src = "live"
+            if rssi is None:
+                rssi = M.rssi_from_distance(d)
+                rssi_src = "model"
 
             # Handover — pause clock during association
             handover = (ap_idx != prev_ap and prev_ap != -1)
@@ -763,7 +840,10 @@ def run_loop(car1, server, srv_if, aps, video_file,
                     total_paused += time.monotonic() - ho_start
 
             # Impose bandwidth
-            bw = M.throughput_from_rssi(rssi)
+            if hyst_mapper is not None:
+                bw = hyst_mapper.update(rssi)
+            else:
+                bw = M.throughput_from_rssi(rssi, mode=args.bw_mapping)
             set_tc(server, srv_if, bw)
 
             # CDN measurement — use current AP's dedicated edge cache
@@ -773,23 +853,21 @@ def run_loop(car1, server, srv_if, aps, video_file,
             # Packet loss
             loss = loss_probe.poll()
 
-            # QoE
             stall = (latency >= 3.0 or cache == "UNKNOWN")
-            qoe   = M.cdn_qoe(cache, latency, handover, stall)
 
-            row = "%.1f,%.1f,ap%d,%.2f,%.3f,%s,%.4f,%.0f,%.3f,%.3f,%d,%d\n" % (
-                t, x, ap_idx+1, rssi, bw, cache,
-                latency, speed_bps, loss, qoe, int(handover), speed_kmh)
+            row = "%.1f,%.1f,%.1f,ap%d,%.2f,%s,%.3f,%s,%.4f,%.0f,%.3f,%d,%d,%d\n" % (
+                t, x, d, ap_idx+1, rssi, rssi_src, bw, cache,
+                latency, speed_bps, loss, int(stall), int(handover), speed_kmh)
             f.write(row)
             f.flush()
 
             if live_plot:
                 live_plot.update(t, x, ap_idx, rssi, bw, cache, latency)
 
-            info("  t=%4.0fs x=%+6.1f AP=ap%d rssi=%6.2f bw=%5.2fMbps "
-                 "%s lat=%.3fs loss=%.1f%% QoE=%.2f%s\n"
-                 % (t, x, ap_idx+1, rssi, bw, cache.ljust(7),
-                    latency, loss, qoe,
+            info("  t=%4.0fs x=%+6.1f AP=ap%d rssi=%6.2f(%s) bw=%5.2fMbps "
+                 "%s lat=%.3fs loss=%.1f%%%s\n"
+                 % (t, x, ap_idx+1, rssi, rssi_src, bw, cache.ljust(7),
+                    latency, loss,
                     "  [HO]" if handover else ""))
 
             # Sleep for remainder of SAMPLE_DT
@@ -816,6 +894,13 @@ if __name__ == "__main__":
                    help="Start mobility immediately (no CLI)")
     p.add_argument("--no-gui",  action="store_true",
                    help="Skip live plot (for headless batch runs)")
+    p.add_argument("--bw-mapping", dest="bw_mapping", default="step2h",
+                   choices=["linear", "step", "step2", "step2h"],
+                   help="RSSI->bandwidth mapping, same modes as the DASH "
+                        "arm (see baseline_model.py). Default step2h — "
+                        "the mapping dash-baseline landed on (best QoE, "
+                        "fewest switches) — keep it in sync with the DASH "
+                        "arm for a fair comparison (TEAMMATE_SETUP.md #2).")
     args = p.parse_args()
     setLogLevel("info")
     topology(args)

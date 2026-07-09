@@ -37,7 +37,7 @@ import config
 
 from cdn_baseline_topo import (
     write_nginx_configs, setup_tc, set_tc,
-    PingLossPoller, measure_cdn,
+    PingLossPoller, VlcTelemetryPoller, measure_cdn, parse_rssi,
     flush_host_state, warmup_connectivity,
     set_static_arp, verify_connectivity,
     disable_mn_wifi_graph_updates,
@@ -57,6 +57,14 @@ VIDEO       = {1: config.VIDEO_HIT, 2: config.VIDEO_MISS}
 VLC_PLAYER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vlc_player.py')
 
 HANDOVER_SETTLE_TIME = 0.60
+
+# small buffer over the nominal coverage radius, matching
+# dash-baseline/baseline_4rsu_topo.py's RANGE_M exactly. Previously this was
+# AP_COVERAGE*1.5 (450m on a 500m AP spacing -- 400m of overlap between
+# neighbouring APs, vs. DASH's 200m), which drowned out each AP's own
+# signal in interference from its neighbours and was the real reason live
+# RSSI never peaked near AP2/AP3/AP4 even after the per-AP SSID fix.
+AP_RANGE_M = int(M.AP_COVERAGE) + 50
 
 
 def cooperative_warm(server, ap_idx, video_file, block=False):
@@ -242,23 +250,62 @@ def ensure_assoc_sdn(car1, ap, ap_idx, retries=8, wait=1.0):
         pass
 
     intf = car1.wintfs[0]
+    ap_intf = ap.wintfs[0]
+    bssid = target_mac or ap_intf.mac
+
+    def _confirm():
+        # mn_wifi's own bookkeeping (freq/channel/mode/ssid), mirroring
+        # what update_client_params() does -- other mn_wifi internals
+        # (e.g. mobility.py's ap_in_range(), which pushes live RSSI into
+        # hwsim) read these attributes, so keep them accurate even though
+        # we're bypassing setAssociation()/iw_connect() below.
+        intf.freq = ap_intf.freq
+        intf.channel = ap_intf.channel
+        intf.mode = ap_intf.mode
+        intf.ssid = ap_intf.ssid
+        intf.associatedTo = ap_intf
+
     for attempt in range(1, retries + 1):
         intf.associatedTo = None
+        # Bypass car1.setAssociation()/mn_wifi's own iw_connect() here --
+        # that path runs `iw dev <intf> connect <ssid> <bssid>` with NO
+        # frequency argument, and never calls anything that would retune
+        # the radio either (update_client_params() only touches a Python
+        # bookkeeping attribute; Station has no setChannel() branch at
+        # all -- see link.py). Since our 4 APs each use a different
+        # channel, that left car1's simulated radio parked on AP1's
+        # channel for the whole run regardless of which AP it was
+        # "associated" with at the BSSID level -- the actual root cause
+        # of live RSSI never recovering at AP2/AP3/AP4 (only ever tracked
+        # distance from AP1). `iw connect` DOES support an explicit
+        # frequency argument for exactly this case, so issue it directly.
+        # ap_intf.freq is stored in GHz (e.g. 2.412), matching
+        # mn_wifi/frequency.py's own convention -- but `iw connect` needs
+        # MHz as a plain integer (e.g. 2412). format_freq() does exactly
+        # that conversion (it's the same helper setAPChannel() uses
+        # internally for hostapd_cli), so use it rather than passing the
+        # GHz float straight through, which `iw` would reject.
+        freq_mhz = ap_intf.format_freq()
+        out = ''
         try:
-            car1.setAssociation(ap, intf='car1-wlan0')
+            car1.cmd('iw dev car1-wlan0 disconnect')
+            out = car1.cmd('iw dev car1-wlan0 connect %s %s %s'
+                            % (ap_intf.ssid, freq_mhz, bssid))
         except Exception as e:
-            info('*** setAssoc warning: %s\n' % e)
+            out = 'exception: %s' % e
+        if out and out.strip():
+            info('*** iw connect ap%d @ %sMHz -> %s\n' % (ap_idx+1, freq_mhz, out.strip()))
         time.sleep(wait)
         link = car1.cmd('iw dev car1-wlan0 link')
         if 'Connected to' in link:
             if not target_mac:
                 info('*** Associated with ap%d (attempt %d)\n' % (ap_idx+1, attempt))
-                intf.associatedTo = ap.wintfs[0]
+                _confirm()
                 return True
             m = re.search(r'Connected to ([0-9a-f:]{17})', link)
             if m and m.group(1).lower() == target_mac:
                 info('*** Associated with ap%d (attempt %d)\n' % (ap_idx+1, attempt))
-                intf.associatedTo = ap.wintfs[0]
+                _confirm()
                 return True
             info('*** Attempt %d: connected to wrong AP, retrying\n' % attempt)
         else:
@@ -271,7 +318,7 @@ def ensure_assoc_sdn(car1, ap, ap_idx, retries=8, wait=1.0):
         link = car1.cmd('iw dev car1-wlan0 link')
         if 'Connected to' in link:
             info('*** Background association confirmed (ap%d)\n' % (ap_idx+1,))
-            intf.associatedTo = ap.wintfs[0]
+            _confirm()
             return True
     info('*** Could not associate with ap%d\n' % (ap_idx+1,))
     return False
@@ -304,18 +351,25 @@ def topology(args):
 
     info('*** Adding Ryu remote controller\n')
     c0 = net.addController('c0', controller=RemoteController,
-                           ip='127.0.0.1', port=6653)
+                           ip='127.0.0.1', port=args.ryu_port)
 
     info('*** Adding 4 APs (OpenFlow13, SDN, non-overlapping channels)\n')
     aps = []
     for i, xpos in enumerate(M.AP_POSITIONS):
         ap = net.addAccessPoint(
             'ap%d' % (i + 1),
-            ssid      = 'cdn-baseline',
+            # unique SSID per AP, matching dash-baseline's RSU_SSIDS pattern
+            # -- all 4 APs sharing one SSID confused wmediumd's live-RSSI
+            # tracking after the first handover (post-handover live rssi
+            # stopped correlating with real distance to the newly
+            # associated AP even though the BSSID itself was verified
+            # correct -- found by comparing against DASH's own live-RSSI
+            # sawtooth, which recovers at every RSU).
+            ssid      = 'cdn-ap%d' % (i + 1),
             mode      = 'g',
             channel   = str([1, 6, 11, 3][i]),   # non-overlapping, same as no-SDN
             position  = '%.1f,0,0' % xpos,
-            range     = int(M.AP_COVERAGE * 1.5),
+            range     = AP_RANGE_M,
             protocols = 'OpenFlow13',
             cls       = OVSKernelAP,
         )
@@ -327,7 +381,7 @@ def topology(args):
     # car1 starts at START_X (coverage edge of AP1, same as DASH scenario)
     info('*** Adding car1 (starting at AP1 coverage edge)\n')
     car1 = net.addStation('car1', ip='10.0.0.1/8',
-                          position='%.1f,0,0' % M.START_X, range=int(M.AP_COVERAGE * 1.5))
+                          position='%.1f,0,0' % M.START_X, range=AP_RANGE_M)
 
     info('*** Adding server1 (origin + edge cache)\n')
     server = net.addHost('server1', ip='%s/8' % ORIGIN_IP)
@@ -380,6 +434,19 @@ def topology(args):
     time.sleep(1)
 
     # ── SDN warmup: pre-touch every AP to prime Ryu flow rules ────────────
+    # Each AP gets a real association+disconnect here (not just a teleport
+    # past it) -- without the explicit disconnect, car1 used to jump
+    # straight from one AP's exact coordinates to the next's without ever
+    # tearing down cleanly, four times in ~1s total (impossible for a real
+    # vehicle). That looked like the cause of a real bug: live RSSI would
+    # never recover for AP2/AP3/AP4 during the actual drive later (only
+    # AP1 ever showed a correct signal peak) -- consistent with
+    # mac80211_hwsim/wmediumd's per-BSSID signal tracking getting stuck on
+    # the stale, abruptly-abandoned warmup contact instead of refreshing
+    # from the real gradual approach. Disconnecting properly (both the
+    # kernel `iw disconnect` and mn_wifi's own associatedTo bookkeeping,
+    # via intf.disconnect()) after each warmup touch gives every AP a
+    # clean slate before the real run's handovers reach it.
     info('*** [WARMUP] Pre-touching every AP to prime Ryu flow rules\n')
     for i, (ap, xpos) in enumerate(zip(aps, M.AP_POSITIONS)):
         info('*** [WARMUP] ap%d at x=%.0f\n' % (i + 1, xpos))
@@ -391,6 +458,11 @@ def topology(args):
             pass
         time.sleep(0.8)
         car1.cmd('ping -c 1 -W 1 %s > /dev/null 2>&1' % ORIGIN_IP)
+        try:
+            car1.wintfs[0].disconnect(ap.wintfs[0])
+        except Exception:
+            pass
+        time.sleep(0.2)
     car1.setPosition('%.1f,0,0' % M.START_X)
     time.sleep(0.5)
     info('*** [WARMUP] Done — Ryu flow rules primed\n')
@@ -506,9 +578,15 @@ def run_loop_sdn(car1, server, srv_if, aps, video_file, sit,
     ho_csv = open(ho_csv_path, 'w')
     ho_csv.write('run_id,t,x,ap_from,ap_to,wifi_assoc_ms\n')
 
+    # No 'qoe' column here on purpose -- QoE is derived post-hoc from these
+    # raw signals (see baseline_model.compute_cdn_qoe()), same as the DASH
+    # arm's raw CSV never bakes in a qoe value either. That way a formula
+    # change (mu, thresholds, ...) never requires re-running the experiment
+    # -- just recompute from the CSV already on disk.
     with open(out_csv, 'w') as f:
-        f.write('t,x,ap,rssi,bw_mbps,cache,latency_s,'
-                'speed_bps,loss_pct,qoe,handover,vehicle_speed_kmh\n')
+        f.write('t,x,dist,ap,rssi,rssi_src,bw_mbps,cache,latency_s,'
+                'speed_bps,loss_pct,stall,vlc_buffer_pct,vlc_cum_stall_s,'
+                'handover,vehicle_speed_kmh\n')
 
         prev_ap      = -1
         total_paused = 0.0
@@ -517,11 +595,17 @@ def run_loop_sdn(car1, server, srv_if, aps, video_file, sit,
         info('*** Drive %.0f→%.0f m @ %.1f km/h (%.0fs total)\n'
              % (M.START_X, M.END_X, speed_kmh, total))
 
+        # step2h is stateful (Schmitt-trigger dead-band around each step2
+        # boundary) -- instantiate once per run, same pattern as
+        # dash-baseline/baseline_4rsu_topo.py so both arms share the mapper.
+        hyst_mapper = M.Step2HysteresisMapper() if args.bw_mapping == 'step2h' else None
+
         out_dir = os.path.dirname(out_csv)
         vlc_paths = vlc_start(
             car1, out_dir, run_id,
             'http://%s:%d/%s' % (EDGE_IP, EDGE_PORTS[0], video_file),
             show=args.vlc_show)
+        vlc_tel = VlcTelemetryPoller(vlc_paths['tel'])
 
         t_start = time.monotonic()
 
@@ -537,7 +621,11 @@ def run_loop_sdn(car1, server, srv_if, aps, video_file, sit,
 
             ap_idx = M.nearest_ap_index(x)
             d      = abs(x - M.AP_POSITIONS[ap_idx])
-            rssi   = M.rssi_from_distance(d)
+            rssi   = parse_rssi(car1.cmd('iw dev car1-wlan0 link'))
+            rssi_src = 'live'
+            if rssi is None:
+                rssi = M.rssi_from_distance(d)
+                rssi_src = 'model'
 
             handover = (ap_idx != prev_ap and prev_ap != -1)
             if ap_idx != prev_ap:
@@ -576,28 +664,35 @@ def run_loop_sdn(car1, server, srv_if, aps, video_file, sit,
                     warmup_connectivity(car1, server)
                     total_paused += time.monotonic() - ho_start
 
-            bw = M.throughput_from_rssi(rssi)
+            if hyst_mapper is not None:
+                bw = hyst_mapper.update(rssi)
+            else:
+                bw = M.throughput_from_rssi(rssi, mode=args.bw_mapping)
             set_tc(server, srv_if, bw)
 
             cache, latency, speed_bps = measure_cdn(
                 car1, video_file, EDGE_IP, EDGE_PORTS[ap_idx])
 
-            loss  = loss_probe.poll()
-            stall = (latency >= 3.0 or cache == 'UNKNOWN')
-            qoe   = M.cdn_qoe(cache, latency, handover, stall)
+            loss = loss_probe.poll()
+            vlc_stalling, vlc_buffer_pct, vlc_cum_stall_s = vlc_tel.poll()
+            # a stall is a stall whether it shows up as network-side latency
+            # (cache MISS timeout) or as a real libvlc buffer underrun --
+            # either signal on its own is enough to count this tick as one.
+            stall = (latency >= 3.0 or cache == 'UNKNOWN' or vlc_stalling)
 
-            f.write('%.1f,%.1f,ap%d,%.2f,%.3f,%s,%.4f,%.0f,%.3f,%.3f,%d,%d\n' % (
-                t, x, ap_idx+1, rssi, bw, cache,
-                latency, speed_bps, loss, qoe, int(handover), speed_kmh))
+            f.write('%.1f,%.1f,%.1f,ap%d,%.2f,%s,%.3f,%s,%.4f,%.0f,%.3f,%d,%.1f,%.3f,%d,%d\n' % (
+                t, x, d, ap_idx+1, rssi, rssi_src, bw, cache,
+                latency, speed_bps, loss, int(stall), vlc_buffer_pct,
+                vlc_cum_stall_s, int(handover), speed_kmh))
             f.flush()
 
             if live_plot:
                 live_plot.update(t, x, ap_idx, rssi, bw, cache, latency)
 
-            info('  t=%4.0fs x=%+6.1f AP=ap%d rssi=%6.2f bw=%5.2fMbps '
-                 '%s lat=%.3fs loss=%.1f%% QoE=%.2f%s\n'
-                 % (t, x, ap_idx+1, rssi, bw, cache.ljust(7),
-                    latency, loss, qoe,
+            info('  t=%4.0fs x=%+6.1f AP=ap%d rssi=%6.2f(%s) bw=%5.2fMbps '
+                 '%s lat=%.3fs loss=%.1f%% vlc_buf=%.0f%%%s\n'
+                 % (t, x, ap_idx+1, rssi, rssi_src, bw, cache.ljust(7),
+                    latency, loss, vlc_buffer_pct,
                     '  [HO]' if handover else ''))
 
             used = time.monotonic() - t_start - total_paused - drive_time
@@ -627,6 +722,18 @@ if __name__ == '__main__':
                          '(manual/demo runs only — needs a reachable X '
                          'display; run_baseline_sdn.sh never passes this, '
                          'batch runs stay headless).')
+    p.add_argument('--ryu-port', dest='ryu_port', type=int, default=6653,
+                    help='OpenFlow TCP port the Ryu controller is listening '
+                         'on — must match the --ofp-tcp-listen-port passed '
+                         'to ryu-manager. Override when 6653 is already '
+                         'held by another controller instance.')
+    p.add_argument('--bw-mapping', dest='bw_mapping', default='step2h',
+                    choices=['linear', 'step', 'step2', 'step2h'],
+                    help='RSSI->bandwidth mapping, same modes as the DASH '
+                         'arm (see baseline_model.py). Default step2h — '
+                         'the mapping dash-baseline landed on (best QoE, '
+                         'fewest switches) — keep it in sync with the DASH '
+                         'arm for a fair comparison (TEAMMATE_SETUP.md #2).')
     args = p.parse_args()
     setLogLevel('info')
     topology(args)

@@ -7,13 +7,14 @@
 # =============================================================================
 set -euo pipefail
 
-SIT=1; SPEED=20; ROUND=1
+SIT=1; SPEED=20; ROUND=1; PORT=6653
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sit)   SIT="$2";   shift 2 ;;
         --speed) SPEED="$2"; shift 2 ;;
         --round) ROUND="$2"; shift 2 ;;
+        --port)  PORT="$2";  shift 2 ;;
         *) echo "[ERROR] Unknown: $1"; exit 1 ;;
     esac
 done
@@ -38,51 +39,84 @@ python3 -c "import vlc" 2>/dev/null || {
     exit 1
 }
 
-# Cleanup
-mn -c > /dev/null 2>&1 || true
-pkill -f ryu 2>/dev/null || true
-rm -f /tmp/nginx_cdn_baseline*.pid /tmp/nginx_baseline*.pid /tmp/cdn_baseline_ping.log
-rm -rf /tmp/cdn_baseline_cache
-sleep 2
+# This machine's real WiFi hardware (Realtek rtw89_8852be) has a firmware
+# bug that can fire at any time and force the kernel to restart the whole
+# mac80211 subsystem -- that drags down mac80211_hwsim (the *simulated*
+# radios mininet-wifi/wmediumd depend on) along with the real card, killing
+# the run mid-flight with a BrokenPipeError. It's an intermittent hardware
+# timing issue (roughly once per 12-15 min of runtime in practice), not
+# something in this project's code, and not tied to any particular AP zone
+# or bandwidth tier -- so rather than touching real WiFi config (which
+# would cost you connectivity for the run's duration), just retry the
+# whole run a few times. A retry is very likely to land clean since the
+# bug is intermittent, not deterministic.
+MAX_ATTEMPTS=3
+SUCCESS=false
 
-# Start Ryu controller
-echo "[1/3] Starting Ryu controller..."
-(cd "$PROJECT/Ryu-SDN-Controller" && \
- RUN_ID="$RUN_ID" \
- HANDOVER_CSV_PATH="$OUT_DIR/ryu_ho_${RUN_ID}.csv" \
- "$RYU_PYTHON" -m ryu.cmd.manager cdn_switch_13.py \
- --ofp-tcp-listen-port 6653) \
-    > /tmp/ryu_${RUN_ID}.log 2>&1 &
-RYU_PID=$!
+for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
+    echo "------------------------------------------------------------"
+    echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS"
+    echo "------------------------------------------------------------"
 
-# Wait for Ryu to be ready (port open + extra settle time)
-RYU_UP=false
-for i in $(seq 1 30); do
-    if ss -tlnp 2>/dev/null | grep -q ':6653'; then
-        echo "      Ryu is up! (${i}s) — waiting 3s for OpenFlow handler..."
-        sleep 3
-        RYU_UP=true
-        break
+    # Cleanup
+    mn -c > /dev/null 2>&1 || true
+    pkill -f ryu 2>/dev/null || true
+    rm -f /tmp/nginx_cdn_baseline*.pid /tmp/nginx_baseline*.pid /tmp/cdn_baseline_ping.log
+    rm -rf /tmp/cdn_baseline_cache
+    sleep 2
+
+    # Start Ryu controller
+    echo "[1/3] Starting Ryu controller (port $PORT)..."
+    (cd "$PROJECT/Ryu-SDN-Controller" && \
+     RUN_ID="$RUN_ID" \
+     HANDOVER_CSV_PATH="$OUT_DIR/ryu_ho_${RUN_ID}.csv" \
+     "$RYU_PYTHON" -m ryu.cmd.manager cdn_switch_13.py \
+     --ofp-tcp-listen-port "$PORT") \
+        > /tmp/ryu_${RUN_ID}.log 2>&1 &
+    RYU_PID=$!
+
+    # Wait for Ryu to be ready (port open + extra settle time)
+    RYU_UP=false
+    for i in $(seq 1 30); do
+        if ss -tlnp 2>/dev/null | grep -q ":${PORT}"; then
+            echo "      Ryu is up! (${i}s) — waiting 3s for OpenFlow handler..."
+            sleep 3
+            RYU_UP=true
+            break
+        fi
+        sleep 1
+    done
+    if [[ "$RYU_UP" == false ]]; then
+        echo "[ERROR] Ryu did not start within 30s — retrying"
+        kill "$RYU_PID" 2>/dev/null || true
+        continue
     fi
-    sleep 1
+
+    # Run topology
+    echo "[2/3] Running topology..."
+    if python3 "$BASELINE/cdn_baseline_topo_sdn.py" \
+        --sit   "$SIT"   \
+        --speed "$SPEED" \
+        --round "$ROUND" \
+        --out-dir "$OUT_DIR" \
+        --ryu-port "$PORT" \
+        --auto \
+        --no-gui; then
+        SUCCESS=true
+        kill "$RYU_PID" 2>/dev/null || true
+        break
+    else
+        echo "[WARN] Topology run crashed on attempt $ATTEMPT/$MAX_ATTEMPTS"
+        echo "       (likely the real-WiFi firmware bug, not this project's code)"
+        kill "$RYU_PID" 2>/dev/null || true
+        sleep 3
+    fi
 done
-if [[ "$RYU_UP" == false ]]; then
-    echo "[ERROR] Ryu did not start within 30s — aborting"
+
+if [[ "$SUCCESS" != true ]]; then
+    echo "[ERROR] All $MAX_ATTEMPTS attempts failed — giving up"
     exit 1
 fi
-
-# Run topology
-echo "[2/3] Running topology..."
-python3 "$BASELINE/cdn_baseline_topo_sdn.py" \
-    --sit   "$SIT"   \
-    --speed "$SPEED" \
-    --round "$ROUND" \
-    --out-dir "$OUT_DIR" \
-    --auto \
-    --no-gui
-
-# Stop Ryu
-kill "$RYU_PID" 2>/dev/null || true
 
 # Copy Ryu log
 cp /tmp/ryu_${RUN_ID}.log "$OUT_DIR/" 2>/dev/null || true
