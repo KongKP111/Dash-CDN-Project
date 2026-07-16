@@ -47,9 +47,18 @@ MIDPOINT = [
 #   QoE = sum(q(R_k)) - mu * sum(|q(R_k+1) - q(R_k)|) - sum(T_k)
 # q(R_k) = bitrate (Mbps) of the rendition, NOT the old toy 1-5 MOS scale.
 # mu=1 (standard default). T_k = rebuffer seconds before segment k, taken
-# directly from the 'stall' flag (each row is one SAMPLE_DT=1s tick, and
-# RebufferEstimator sets stall=1 exactly when that whole tick was a
-# buffer underrun — see dash-baseline/baseline_topo.py).
+# directly from the 'stall' flag, scaled by this row's REAL elapsed time
+# (see compute_dash_qoe() below) -- NOT a fixed SAMPLE_DT=1s per stalled
+# row as this comment used to claim. This file actually pairs with
+# dash-baseline/baseline_4rsu_topo.py's output (results/dash_baseline/,
+# confirmed via that dir's own /tmp/dash_4rsu/results_4rsu/ fallback path
+# below), whose real SAMPLE_DT is 0.5s (baseline_4rsu_model.py), not 1.0s
+# (baseline_model.py) -- a fixed 1.0 overcounted every stalled row's
+# rebuffer penalty by ~2x. And since that arm's run loop is now wall-clock
+# driven (Option 2, ported alongside this fix), a tick's real duration
+# isn't even a fixed 0.5s anymore -- it genuinely varies (handover
+# struggles run long), so a real per-row dt is required either way, not
+# just a smaller fixed constant.
 _BITRATE_MBPS = {"360p": 1.0, "720p": 2.5, "1080p": 5.0}
 _MU = 1.0
 
@@ -80,15 +89,25 @@ def col(rows, key, cast=float):
 def compute_dash_qoe(rows):
     """Per-row Yin et al. QoE term: q(R_k) - mu*|q(R_k)-q(R_k-1)| - T_k.
     Summing the returned list gives the run's total QoE from the formula;
-    plotted as-is it's the per-sample QoE contribution over position/time."""
-    qoes, prev_bitrate = [], None
+    plotted as-is it's the per-sample QoE contribution over position/time.
+
+    T_k = this row's real elapsed seconds (dt, from consecutive rows' own
+    't' column) if 'stall' is set, else 0 -- NOT a fixed 1.0 regardless of
+    dt (see the module-level comment above for why that was wrong for the
+    data this function actually processes). First row has no previous
+    timestamp to diff against, so its dt is 0.0 -- same minor, unavoidable
+    edge case as baseline_model.py's compute_cdn_qoe()."""
+    qoes, prev_bitrate, prev_t = [], None, None
     for r in rows:
         bitrate = _BITRATE_MBPS.get(r['quality'], 0.0)
         switch_penalty = (_MU * abs(bitrate - prev_bitrate)
                            if prev_bitrate is not None else 0.0)
-        rebuf_s = float(r.get('stall', 0))
+        t = float(r['t'])
+        dt = (t - prev_t) if prev_t is not None else 0.0
+        rebuf_s = dt if int(r.get('stall', 0)) else 0.0
         qoes.append(bitrate - switch_penalty - rebuf_s)
         prev_bitrate = bitrate
+        prev_t = t
     return qoes
 
 def zone_spans(xmin, xmax):

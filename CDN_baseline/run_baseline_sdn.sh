@@ -127,10 +127,14 @@ CSV_FILE="$OUT_DIR/${RUN_ID}.csv"
 if [[ -f "$CSV_FILE" ]]; then
     HIT_N=$(grep -c ",HIT,"     "$CSV_FILE" 2>/dev/null || true)
     MISS_N=$(grep -c ",MISS,"   "$CSV_FILE" 2>/dev/null || true)
-    UNK_N=$(grep -c ",UNKNOWN," "$CSV_FILE" 2>/dev/null || true)
-    TOTAL=$(( HIT_N + MISS_N + UNK_N ))
+    # 'LOSS' replaced the old 'UNKNOWN' cache tier (see cdn_baseline_topo_sdn.py's
+    # outage tracking + DASH_HANDOFF_SITUATION2.md) -- a request that got no
+    # answer at all (outage or timed-out probe) is a connection LOSS, not an
+    # ambiguous cache state.
+    LOSS_N=$(grep -c ",LOSS,"   "$CSV_FILE" 2>/dev/null || true)
+    TOTAL=$(( HIT_N + MISS_N + LOSS_N ))
     echo "[OK] $RUN_ID"
-    echo "     Cache  →  HIT:${HIT_N}  MISS:${MISS_N}  UNKNOWN:${UNK_N}  (total samples: ${TOTAL})"
+    echo "     Cache  →  HIT:${HIT_N}  MISS:${MISS_N}  LOSS:${LOSS_N}  (total samples: ${TOTAL})"
     # Warn if unexpected MISS for sit 1
     if [[ "$SIT" == "1" && "$MISS_N" -gt 0 ]]; then
         echo "[WARN] sit 1 should be all HIT — found ${MISS_N} MISS rows"

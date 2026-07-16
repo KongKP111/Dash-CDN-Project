@@ -280,12 +280,28 @@ class PlatoonThrottleController:
 #  Platoon mobility + handover + per-vehicle network logging
 # ===========================================================================
 def run_platoon(cars, server, rsu_objs, throttle, out_dir, run_id,
-                 n_cars, total_t):
+                 n_cars, total_t, handover_timeout=8.0):
     intf_of = {i: f'{cars[i].name}-wlan0' for i in range(n_cars)}
     last_signal = [-50] * n_cars
     current_rsu = [None] * n_cars
     loss_pollers = []
     net_rows = [[] for _ in range(n_cars)]
+
+    # Handover-in-progress state per vehicle, carried ACROSS ticks -- one
+    # association attempt per tick (ensure_assoc(..., retries=1)), not the
+    # old single blocking multi-retry call, so a struggling handover
+    # produces one real measured sample per attempt instead of the vehicle
+    # "teleporting" from the last good sample to wherever it finally
+    # resolves. Ported from Situation2_DASH/baseline_4rsu_topo.py's
+    # run_loop() (itself ported from CDN_SIT2's run_loop_sdn(), see
+    # DASH_HANDOFF_SITUATION2.md), generalized to N vehicles via per-car
+    # state arrays -- same shape as CDN_SIT1/cdn_sdn_multi_car.py's own
+    # platoon loop (read-only reference, not touched).
+    handover_active     = [False] * n_cars
+    handover_start_wall = [0.0] * n_cars
+    handover_attempts   = [0] * n_cars
+    handover_from_rsu   = [None] * n_cars
+    cum_outage_s        = [0.0] * n_cars
 
     # ---- initial placement + association (t = 0) -------------------------
     for i, car in enumerate(cars):
@@ -312,70 +328,119 @@ def run_platoon(cars, server, rsu_objs, throttle, out_dir, run_id,
              f'-> {rsu_name} sig={sig}dBm\n')
 
     info(f'*** Platoon of {n_cars} vehicles moving for ~{total_t:.0f}s '
-         f'(10 m gap, {C.SPEED_KMH:.0f} km/h)\n')
+         f'(10 m gap, {C.SPEED_KMH:.0f} km/h, '
+         f'handover-timeout={handover_timeout:.1f}s)\n')
 
     t0 = time.time()
+    prev_t = 0.0
     while True:
         t = time.time() - t0
         if t >= total_t:
             break
         time.sleep(C.SAMPLE_DT_S)
         t = time.time() - t0
+        dt = t - prev_t
+        prev_t = t
 
         for i, car in enumerate(cars):
             x, y = C.vehicle_position(i, t)
             car.setPosition(f'{x},{y},0')
             target_rsu = C.target_rsu_by_zone(x, y)
+            outage = False
+            handover_flag = 0
 
-            if target_rsu != current_rsu[i]:
-                info(f'*** [{car.name}] handover: '
-                     f'{current_rsu[i]} -> {target_rsu}\n')
+            # Trigger a new handover attempt sequence not just when the
+            # zone changed, but also when the link spontaneously dropped
+            # while still nominally on the same RSU (a real 802.11
+            # disconnect/interference event) -- same two-condition check
+            # as Situation2/CDN_SIT2's run_loop_sdn(). Without the second
+            # branch, a spontaneous drop that isn't caused by crossing an
+            # RSU boundary would silently fall through to stale-signal
+            # reporting instead of being caught as a real outage.
+            if not handover_active[i]:
+                needs_handover = (target_rsu != current_rsu[i])
+                link_ok = True
+                if not needs_handover:
+                    link_ok = 'Connected to' in get_link_info(car)
+                if needs_handover or not link_ok:
+                    handover_active[i] = True
+                    handover_start_wall[i] = time.time()
+                    handover_attempts[i] = 0
+                    handover_from_rsu[i] = current_rsu[i]
+                    if needs_handover:
+                        info(f'*** [{car.name}] handover: '
+                             f'{current_rsu[i]} -> {target_rsu}\n')
+                    else:
+                        info(f'*** [{car.name}] link lost -- '
+                             f're-associating with {current_rsu[i]}\n')
+
+            if handover_active[i]:
+                handover_attempts[i] += 1
+                # re-target fresh every attempt -- the vehicle may have
+                # drifted to a different RSU's zone by attempt N
+                target_rsu = C.target_rsu_by_zone(x, y)
                 link_out = ensure_assoc(car, rsu_objs[target_rsu],
-                                         retries=4, wait=0.8)
-                if 'Connected to' not in link_out:
-                    time.sleep(0.3)
-                    link_out = ensure_assoc(car, rsu_objs[target_rsu],
-                                             retries=2, wait=0.5)
-                if 'Connected to' in link_out:
+                                         retries=1, wait=0.8)
+                elapsed = time.time() - handover_start_wall[i]
+                ok = 'Connected to' in link_out
+
+                if ok:
+                    handover_active[i] = False
                     flush_host_state(car, server)
                     warmup_connectivity(car, server)
+                    if handover_from_rsu[i] is not None and \
+                       handover_from_rsu[i] != target_rsu:
+                        handover_flag = 1
                     current_rsu[i] = target_rsu
-                    time.sleep(HANDOVER_SETTLE_S)
+                    info(f'*** [{car.name}] handover confirmed in '
+                         f'{elapsed:.2f}s ({handover_attempts[i]} attempts)\n')
+                elif elapsed >= handover_timeout:
+                    handover_active[i] = False
+                    outage = True
+                    info(f'*** [{car.name}] OUTAGE: gave up after '
+                         f'{elapsed:.1f}s ({handover_attempts[i]} attempts)\n')
+                    # current_rsu[i] deliberately left unchanged -- next
+                    # tick re-evaluates target_rsu_by_zone() at the
+                    # further-along position and starts a fresh attempt
+                    # sequence against whichever RSU that is.
                 else:
-                    # Association genuinely failed after all retries. Do NOT
-                    # advance current_rsu[i] -- bookkeeping (throttle's
-                    # per-RSU contention count, the network CSV's rsu
-                    # column) must reflect where the vehicle actually is,
-                    # not where it was trying to go. Since target_rsu will
-                    # still differ from current_rsu[i], the next tick
-                    # retries the handover automatically (possibly against
-                    # a further-along target if the vehicle has since left
-                    # that zone too).
-                    info(f'*** [{car.name}] still not associated with '
-                         f'{target_rsu} after retries; staying on '
-                         f'{current_rsu[i]}, will retry next tick\n')
+                    # still trying, not yet past the giveup threshold --
+                    # every attempt starts from a real disconnect, so this
+                    # tick is genuinely disconnected too, just not a final
+                    # give-up yet.
+                    outage = True
             else:
                 link_out = get_link_info(car)
-                if 'Connected to' not in link_out:
-                    link_out = ensure_assoc(car, rsu_objs[target_rsu],
-                                             retries=4, wait=0.8)
-                    flush_host_state(car, server)
-                    warmup_connectivity(car, server)
 
-            _, sig = C.parse_link_info(link_out, last_signal[i])
-            last_signal[i] = sig
-            throttle.update_car_state(i, current_rsu[i], sig)
-            loss_pct = loss_pollers[i].poll()
-            alloc_rate = throttle.get_rate(i)
+            if outage:
+                cum_outage_s[i] += dt
+                # verified outage -- don't let a stale signal/rate/loss
+                # reading quietly imply the vehicle is receiving something
+                # it isn't.
+                sig = last_signal[i]
+                loss_pct = 100.0
+                alloc_rate = 0.0
+            else:
+                _, sig = C.parse_link_info(link_out, last_signal[i])
+                last_signal[i] = sig
+                throttle.update_car_state(i, current_rsu[i], sig)
+                loss_pct = loss_pollers[i].poll()
+                alloc_rate = throttle.get_rate(i)
 
             net_rows[i].append({
                 't': round(t, 2), 'x': round(x, 2), 'y': round(y, 2),
                 'rsu': current_rsu[i], 'rssi_dbm': sig,
                 'allocated_bw_mbps': alloc_rate if alloc_rate is not None else '',
                 'icmp_loss_pct': loss_pct,
+                'handover': handover_flag,
+                'outage': int(outage),
+                'cum_outage_s': round(cum_outage_s[i], 3),
             })
 
     info('*** Platoon mobility completed.\n')
+    for i in range(n_cars):
+        info(f'*** [car{i+1}] total outage: {cum_outage_s[i]:.1f}s '
+             f'({100.0 * cum_outage_s[i] / max(t, 1e-9):.1f}% of run)\n')
 
     for i in range(n_cars):
         path = os.path.join(out_dir, f'{run_id}_car{i+1}_network.csv')
@@ -390,7 +455,7 @@ def run_platoon(cars, server, rsu_objs, throttle, out_dir, run_id,
 #  Main topology builder
 # ===========================================================================
 def build(n_cars=3, run_id=None, use_cli=False, run_client=False,
-          out_dir='/tmp/platoon_logs', plot=False):
+          out_dir='/tmp/platoon_logs', plot=False, handover_timeout=8.0):
     setLogLevel('info')
 
     if run_id is None:
@@ -499,7 +564,8 @@ def build(n_cars=3, run_id=None, use_cli=False, run_client=False,
         info('*** ================================================\n')
         info('*** CLI mode. To start the platoon run manually:\n')
         info('***   py run_platoon(cars, server, rsu_objs, throttle, '
-             f"'{out_dir}', '{run_id}', {n_cars}, {total_t:.1f})\n")
+             f"'{out_dir}', '{run_id}', {n_cars}, {total_t:.1f}, "
+             f"handover_timeout={handover_timeout})\n")
         info('*** ================================================\n')
         import builtins
         builtins.cars = cars
@@ -545,7 +611,7 @@ def build(n_cars=3, run_id=None, use_cli=False, run_client=False,
 
         info('*** Starting platoon mobility...\n')
         run_platoon(cars, server, rsu_objs, throttle, out_dir, run_id,
-                    n_cars, total_t)
+                    n_cars, total_t, handover_timeout=handover_timeout)
         throttle.stop()
 
         info('*** Mobility done. Waiting for clients to finish...\n')
@@ -586,10 +652,17 @@ def parse_args():
     p.add_argument('--plot', action='store_true',
                     help='open a live topology window (needs a real X '
                          'display -- run from pc1\'s own desktop terminal)')
+    p.add_argument('--handover-timeout', dest='handover_timeout', type=float,
+                    default=8.0,
+                    help='seconds of one-attempt-per-tick retrying before a '
+                         'struggling handover is counted as a verified '
+                         'outage (default: %(default)s, matches '
+                         'Situation2_DASH/CDN_SIT1)')
     return p.parse_args()
 
 
 if __name__ == '__main__':
     a = parse_args()
     build(n_cars=a.cars, run_id=a.run_id, use_cli=a.cli,
-          run_client=a.run_client, out_dir=a.out_dir, plot=a.plot)
+          run_client=a.run_client, out_dir=a.out_dir, plot=a.plot,
+          handover_timeout=a.handover_timeout)

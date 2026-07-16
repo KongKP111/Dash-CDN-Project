@@ -2,16 +2,22 @@
 """
 plot_smoke_run_v2.py -- detailed, paper-ready per-vehicle figure for one
 Situation 1 smoke-test run. No sudo needed; reads the already-saved
-per-vehicle CSVs (segments.csv, network.csv).
+per-vehicle CSVs (segments.csv, network.csv) and summary.json.
 
-Layout: one column per vehicle, three rows per column:
-  1. RSSI (dBm) -- the raw wireless signal driving everything else
-  2. Chosen bitrate vs. hybrid-model allocated bandwidth (Mbps), with
-     rendition reference lines (360p/720p/1080p) and stall markers
+Layout: one column per vehicle, four rows per column:
+  1. RSSI (dBm) -- the raw wireless signal driving everything else, with
+     RSU zone bands and vertical handover markers
+  2. Chosen bitrate (quality) vs. hybrid-model allocated bandwidth
+     (bw_mbps), with rendition reference lines (360p/720p/1080p) and
+     stall markers
   3. ICMP packet loss (%)
-RSU zone is shown as a labeled background band across the top of each
-column so the reader can see WHICH RSU produced a given RSSI/bandwidth
-level, without needing a 4th row.
+  4. Cumulative outage (seconds) -- running total of time spent with any
+     measured loss > 0
+Each column's title also shows that vehicle's final rebuffer_ratio_pct
+(from summary.json). Column set covers the comparison metrics agreed with
+the SDN+CDN teammate: bw_mbps, rssi, loss, cum_outage_s, handover, quality
+(rebuffer_ratio_pct shown once per column, not as a time series, since
+it's a single session-level aggregate).
 
 Time axis is PLATOON-RELATIVE (tau = t - i*LAG_S, i = 0-based vehicle
 index, LAG_S = SPACING_M/SPEED_MPS): every vehicle in the platoon follows
@@ -31,6 +37,7 @@ Run: python3 plot_smoke_run_v2.py <run_id> [--dir DIR] [--cars N]
 """
 import os
 import csv
+import json
 import argparse
 import matplotlib
 matplotlib.use('Agg')
@@ -46,6 +53,7 @@ SPACING_M   = 10.0
 SPEED_KMH   = 20.0
 LAG_S       = SPACING_M / (SPEED_KMH / 3.6)   # seconds between consecutive vehicles
 LOSS_YLIM_DEFAULT = 75.0   # fixed across all car-count figures (real global max seen: 66.67%)
+OUTAGE_YLIM_DEFAULT = 40.0  # fixed across all car-count figures (real global max seen: 33.15s, 7-car)
 
 # ---- validated palette (references/palette.md) ----------------------------
 INK_PRIMARY   = '#0b0b0b'
@@ -59,6 +67,8 @@ SERIES_BITRATE  = '#2a78d6'   # categorical slot 1 (blue)  -- chosen bitrate
 SERIES_ALLOC    = '#eb6834'   # categorical slot 8 (orange) -- allocated ceiling
 STATUS_WARNING  = '#fab219'   # packet loss
 STATUS_CRITICAL = '#d03b3b'   # stall
+STATUS_OUTAGE   = '#ec835a'   # cumulative outage (status "serious")
+HANDOVER_LINE   = '#9085e9'   # categorical slot 5 (violet) -- handover marker, distinct from RSU tints
 
 RSU_TINTS = {   # light background tints, distinct from the two data-series hues
     'rsu1': '#1baf7a',   # aqua
@@ -73,6 +83,10 @@ def load(path):
     return list(csv.DictReader(open(path))) if os.path.exists(path) else []
 
 
+def load_json(path):
+    return json.load(open(path)) if os.path.exists(path) else {}
+
+
 def rsu_spans(tau_list, rsu_list):
     spans, prev, start = [], None, None
     for tau, rsu in zip(tau_list, rsu_list):
@@ -83,6 +97,27 @@ def rsu_spans(tau_list, rsu_list):
     if prev is not None:
         spans.append((prev, start, tau_list[-1]))
     return spans
+
+
+def handover_times(spans):
+    """Handover instants = the start of every span after the first (the
+    first span's start is just the recording start, not a real handover)."""
+    return [t0 for _, t0, _ in spans[1:]]
+
+
+def cumulative_outage(tau_list, loss_list):
+    """Running total (seconds) of time spent in any sample with measured
+    loss > 0. Each sample's dt is charged to outage if THAT sample showed
+    loss (i.e. the interval since the previous sample is treated as lossy)."""
+    cum, out, prev_tau = [], 0.0, None
+    for tau, loss in zip(tau_list, loss_list):
+        if prev_tau is not None:
+            dt = tau - prev_tau
+            if loss > 0:
+                out += dt
+        cum.append(out)
+        prev_tau = tau
+    return cum
 
 
 def main():
@@ -101,30 +136,35 @@ def main():
                      help='fixed ICMP-loss axis ceiling (%%), same across '
                           'all car-count figures for direct comparability '
                           '(default: %(default)s)')
+    ap.add_argument('--outage-ylim', type=float, default=OUTAGE_YLIM_DEFAULT,
+                     help='fixed cumulative-outage axis ceiling (seconds), '
+                          'same across all car-count figures (default: %(default)s)')
     args = ap.parse_args()
     d = args.dir or os.path.join('results_raw', args.run_id)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    fig, axes = plt.subplots(3, args.cars, figsize=(5.6 * args.cars, 9.5),
+    fig, axes = plt.subplots(4, args.cars, figsize=(5.6 * args.cars, 12.0),
                               sharex='col', facecolor=SURFACE,
-                              gridspec_kw={'height_ratios': [1.0, 1.5, 0.8]})
+                              gridspec_kw={'height_ratios': [1.0, 1.5, 0.7, 0.7]})
     if args.cars == 1:
-        axes = axes.reshape(3, 1)
+        axes = axes.reshape(4, 1)
 
-    all_seg, all_net = {}, {}
+    all_seg, all_net, all_summary = {}, {}, {}
     for i in range(args.cars):
         car = f'car{i + 1}'
         all_seg[car] = load(os.path.join(d, f'{args.run_id}_{car}_segments.csv'))
         all_net[car] = load(os.path.join(d, f'{args.run_id}_{car}_network.csv'))
+        all_summary[car] = load_json(os.path.join(d, f'{args.run_id}_{car}_summary.json'))
     loss_ylim = args.loss_ylim
 
+    outage_ylim = args.outage_ylim
     for i in range(args.cars):
         car = f'car{i + 1}'
-        seg, net = all_seg[car], all_net[car]
-        ax_rssi, ax_bw, ax_loss = axes[0, i], axes[1, i], axes[2, i]
+        seg, net, summ = all_seg[car], all_net[car], all_summary[car]
+        ax_rssi, ax_bw, ax_loss, ax_out = axes[0, i], axes[1, i], axes[2, i], axes[3, i]
         shift = i * LAG_S   # platoon-relative time: tau = t - i*LAG_S
 
-        for ax in (ax_rssi, ax_bw, ax_loss):
+        for ax in (ax_rssi, ax_bw, ax_loss, ax_out):
             ax.set_facecolor(SURFACE)
             for spine in ('top', 'right'):
                 ax.spines[spine].set_visible(False)
@@ -143,6 +183,14 @@ def main():
                          ha='center', va='bottom', fontsize=7.5, fontweight='bold',
                          color=INK_SECONDARY)
 
+        # ---- handover markers: one vertical line per RSU transition, drawn
+        # through all 4 rows of this column -----------------------------
+        ho_times = handover_times(spans)
+        for ax in (ax_rssi, ax_bw, ax_loss, ax_out):
+            for ho_t in ho_times:
+                ax.axvline(ho_t, color=HANDOVER_LINE, linewidth=1.0,
+                           linestyle=':', alpha=0.7, zorder=1)
+
         # ---- Row 1: RSSI ---------------------------------------------------
         if net:
             rssi = [float(r['rssi_dbm']) for r in net]
@@ -150,10 +198,12 @@ def main():
             ax_rssi.set_ylim(-80, -35)
             ax_rssi.set_xlim(net_tau[0], net_tau[-1])
         if i == 0:
-            ax_rssi.set_ylabel('RSSI (dBm)', fontsize=9, color=INK_SECONDARY)
-        ax_rssi.set_title(car, fontsize=13, fontweight='bold', color=INK_PRIMARY, pad=22)
+            ax_rssi.set_ylabel('rssi (dBm)', fontsize=9, color=INK_SECONDARY)
+        rebuf = summ.get('rebuffering_ratio')
+        title = car if rebuf is None else f'{car}   (rebuffer {rebuf * 100:.2f}%)'
+        ax_rssi.set_title(title, fontsize=12.5, fontweight='bold', color=INK_PRIMARY, pad=22)
 
-        # ---- Row 2: bitrate vs allocated ------------------------------------
+        # ---- Row 2: bitrate (quality) vs allocated bw_mbps ------------------
         for val, label in RENDITIONS:
             ax_bw.axhline(val, color=GRID, linewidth=1.0, zorder=0)
         if seg:
@@ -172,43 +222,57 @@ def main():
         ax_bw.set_ylim(0, 11)
         ax_bw.set_yticks([0, 1.0, 2.5, 5.0, 7.5, 10])
         if i == 0:
-            ax_bw.set_ylabel('Mbps', fontsize=9, color=INK_SECONDARY)
+            ax_bw.set_ylabel('bw_mbps / quality', fontsize=9, color=INK_SECONDARY)
             ax_bw.set_yticklabels(['0', '1.0 (360p)', '2.5 (720p)', '5.0 (1080p)', '7.5', '10'])
         else:
             ax_bw.set_yticklabels([])
 
         # ---- Row 3: packet loss --------------------------------------------
+        loss = [float(r['icmp_loss_pct']) for r in net] if net else []
         if net:
-            loss = [float(r['icmp_loss_pct']) for r in net]
             ax_loss.fill_between(net_tau, loss, color=STATUS_WARNING, alpha=0.35, step='post')
             ax_loss.plot(net_tau, loss, color=STATUS_WARNING, linewidth=1.4, drawstyle='steps-post')
         ax_loss.set_ylim(0, loss_ylim)
         if i == 0:
-            ax_loss.set_ylabel('ICMP loss (%)', fontsize=9, color=INK_SECONDARY)
-        ax_loss.set_xlabel('τ (s)', fontsize=9, color=INK_SECONDARY)
+            ax_loss.set_ylabel('loss (%)', fontsize=9, color=INK_SECONDARY)
+
+        # ---- Row 4: cumulative outage (seconds) -----------------------------
+        if net:
+            cum_out = cumulative_outage(net_tau, loss)
+            ax_out.fill_between(net_tau, cum_out, color=STATUS_OUTAGE, alpha=0.30, step='post')
+            ax_out.plot(net_tau, cum_out, color=STATUS_OUTAGE, linewidth=1.6, drawstyle='steps-post')
+            final_pct = (cum_out[-1] / net_tau[-1] * 100) if net_tau[-1] else 0.0
+            ax_out.text(0.98, 0.88, f'{cum_out[-1]:.1f}s ({final_pct:.1f}%)',
+                        transform=ax_out.transAxes, ha='right', va='top',
+                        fontsize=7.5, color=STATUS_OUTAGE, fontweight='bold')
+        ax_out.set_ylim(0, outage_ylim)
+        if i == 0:
+            ax_out.set_ylabel('cum_outage_s', fontsize=9, color=INK_SECONDARY)
+        ax_out.set_xlabel('τ (s)', fontsize=9, color=INK_SECONDARY)
 
     # ---- shared legend -------------------------------------------------------
     legend_handles = [
-        Line2D([0], [0], color=SERIES_BITRATE, lw=2.2, label='Chosen bitrate (DASH client)'),
-        Line2D([0], [0], color=SERIES_ALLOC, lw=1.6, ls='--', label='Allocated bandwidth (step2h + contention)'),
-        Line2D([0], [0], color=STATUS_CRITICAL, lw=0, marker='v', markersize=8, label='Stall event'),
-        Line2D([0], [0], color=STATUS_WARNING, lw=1.4, label='ICMP packet loss'),
+        Line2D([0], [0], color=SERIES_BITRATE, lw=2.2, label='quality (chosen bitrate)'),
+        Line2D([0], [0], color=SERIES_ALLOC, lw=1.6, ls='--', label='bw_mbps (allocated, step2h+contention)'),
+        Line2D([0], [0], color=HANDOVER_LINE, lw=1.4, ls=':', label='handover'),
+        Line2D([0], [0], color=STATUS_CRITICAL, lw=0, marker='v', markersize=8, label='stall event'),
+        Line2D([0], [0], color=STATUS_WARNING, lw=1.4, label='loss (%)'),
+        Line2D([0], [0], color=STATUS_OUTAGE, lw=1.6, label='cum_outage_s'),
     ] + [mpatches.Patch(facecolor=RSU_TINTS[r], alpha=0.35, label=r.upper()) for r in ['rsu1', 'rsu2', 'rsu3', 'rsu4']]
 
-    fig.legend(handles=legend_handles, loc='lower center', ncol=4, frameon=False,
-               fontsize=8.5, bbox_to_anchor=(0.5, -0.02),
+    fig.legend(handles=legend_handles, loc='lower center', ncol=5, frameon=False,
+               fontsize=8.5, bbox_to_anchor=(0.5, -0.03),
                labelcolor=INK_SECONDARY)
 
     fig.suptitle(f'Situation 1 (Traffic Density) — {args.run_id} ({args.cars} vehicles)',
                  fontsize=15, fontweight='bold', color=INK_PRIMARY, y=1.01)
     fig.text(0.5, 0.975,
-              'RSSI, chosen DASH bitrate vs. hybrid step2h+contention allocated bandwidth, and ICMP '
-              f'packet loss — one column per vehicle. τ = t − i·{LAG_S:.1f}s aligns every vehicle to the '
-              'same point on the shared route (i = 0-based platoon position), so RSU-zone widths are '
-              'directly comparable across columns.',
+              'rssi, bw_mbps/quality, loss, cum_outage_s, handover — one column per vehicle. '
+              f'τ = t − i·{LAG_S:.1f}s aligns every vehicle to the same point on the shared route '
+              '(i = 0-based platoon position), so RSU-zone widths are directly comparable across columns.',
               fontsize=8.5, color=INK_SECONDARY, ha='center')
 
-    plt.tight_layout(rect=[0.02, 0.05, 1, 0.95])
+    plt.tight_layout(rect=[0.02, 0.06, 1, 0.95])
     out = os.path.join(args.out_dir, f'{args.run_id}_detailed_plot.png')
     plt.savefig(out, dpi=150, facecolor=SURFACE, bbox_inches='tight')
     print('Saved:', out)

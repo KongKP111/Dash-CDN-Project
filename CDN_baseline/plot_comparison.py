@@ -25,9 +25,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import baseline_model as M
 
 # ── Paths ──────────────────────────────────────────────────────────────────
+# Results live under CDN_baseline/results/ (self-contained, same convention
+# as CDN_SIT1/result_multi_car/ and CDN_SIT2/results_hightspeed/) rather
+# than the shared top-level results/ tree.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT    = os.path.dirname(SCRIPT_DIR)
-BASE       = os.path.join(PROJECT, "results", "cdn_baseline")
+BASE       = os.path.join(SCRIPT_DIR, "results")
 
 # ── Colors ─────────────────────────────────────────────────────────────────
 C_SDN   = "#1baf7a"   # green — SDN series
@@ -36,8 +39,13 @@ C_HIT   = "#0ca30c"   # green — HIT status
 C_MISS  = "#e34948"   # red   — MISS status
 C_UNK   = "#888888"   # gray  — UNKNOWN status
 
-SDN_DOT = {'HIT': C_HIT, 'MISS': C_MISS, 'UNKNOWN': C_UNK}
-CV_MAP  = {'HIT': 1, 'MISS': 0, 'UNKNOWN': 0.5}
+# 'LOSS' replaces the old 'UNKNOWN' tier (cdn_baseline_topo[_sdn].py's
+# outage tracking) -- cache HIT/MISS is strictly an edge-content question; a
+# request that got no answer at all (outage or a timed-out probe) is a
+# connection LOSS, not a third cache state. 'UNKNOWN' kept as a fallback key
+# too for any older CSV that still has literal 'UNKNOWN' rows.
+SDN_DOT = {'HIT': C_HIT, 'MISS': C_MISS, 'LOSS': C_UNK, 'UNKNOWN': C_UNK}
+CV_MAP  = {'HIT': 1, 'MISS': 0, 'LOSS': 0.5, 'UNKNOWN': 0.5}
 
 # AP zone background colors + label colors
 AP_BAND = {
@@ -111,6 +119,14 @@ def make_plot(sit, spd, out_root):
             f"cdn_baseline_sdn_sit{sit}_spd{spd}_r1/"
             f"cdn_baseline_sdn_sit{sit}_spd{spd}_r1.csv")
 
+    # Default --sit/--speed sweep every combo (sit 1/2 x speed 20/25/30) --
+    # skip whichever ones haven't actually been run yet instead of crashing
+    # the whole sweep on the first missing one.
+    if not os.path.isfile(path):
+        print(f"  [WARN] no run found for sit{sit} speed{spd} -- skipping "
+              f"({path})")
+        return
+
     rows = load_csv(path)
 
     x     = col(rows, 'x')
@@ -145,7 +161,8 @@ def make_plot(sit, spd, out_root):
     ax.plot(x, qoe, color=C_SDN, lw=1.8, zorder=4)
     ax.fill_between(x, qoe, alpha=0.15, color=C_SDN)
     ax.set_xlim(xmin, xmax)
-    ax.set_ylabel('QoE', fontsize=10)
+    ax.set_xlabel('Position (m)', fontsize=10)
+    ax.set_ylabel('QoE (score)', fontsize=10)
     ax.set_title('Quality of Experience (QoE)', fontsize=10, fontweight='semibold', pad=4)
     ax.text(0.99, 0.06, f'Net QoE = {net_qoe:.1f}  ({len(qoe)} samples, avg {net_qoe/len(qoe):.3f})',
             transform=ax.transAxes, ha='right', va='bottom', fontsize=8.5,
@@ -159,6 +176,7 @@ def make_plot(sit, spd, out_root):
     ax.plot(x, lat, color=C_SDN, lw=1.8, zorder=4)
     ax.fill_between(x, lat, alpha=0.12, color=C_SDN)
     ax.set_ylim(0, 3.5); ax.set_xlim(xmin, xmax)
+    ax.set_xlabel('Position (m)', fontsize=10)
     ax.set_ylabel('Latency (s)', fontsize=10)
     ax.set_title('CDN Latency over Position', fontsize=10, fontweight='semibold', pad=4)
     add_ap_bands(ax, x, ap, xmax, (0, 3.5))
@@ -175,6 +193,7 @@ def make_plot(sit, spd, out_root):
     # data without noticing.
     rssi_ylim = (min(rssi) - 5, max(rssi) + 5)
     ax.set_ylim(*rssi_ylim); ax.set_xlim(xmin, xmax)
+    ax.set_xlabel('Position (m)', fontsize=10)
     ax.set_ylabel('RSSI (dBm)', fontsize=10)
     ax.set_title('Signal Strength (RSSI)', fontsize=10, fontweight='semibold', pad=4)
     add_ap_bands(ax, x, ap, xmax, rssi_ylim)
@@ -190,6 +209,7 @@ def make_plot(sit, spd, out_root):
     ax.step(x, bw, color=C_SDN, lw=1.8, where='post', zorder=4)
     ax.fill_between(x, bw, step='post', alpha=0.15, color=C_SDN)
     ax.set_ylim(0, bw_max); ax.set_xlim(xmin, xmax)
+    ax.set_xlabel('Position (m)', fontsize=10)
     ax.set_ylabel('Bandwidth (Mbps)', fontsize=10)
     ax.set_title('Imposed Bandwidth (step2h)', fontsize=10, fontweight='semibold', pad=4)
     add_ap_bands(ax, x, ap, xmax, (0, bw_max))
@@ -201,6 +221,7 @@ def make_plot(sit, spd, out_root):
     ax.fill_between(x, loss, alpha=0.15, color=C_SDN)
     loss_max = max(max(loss) * 1.2, 5)
     ax.set_ylim(0, loss_max); ax.set_xlim(xmin, xmax)
+    ax.set_xlabel('Position (m)', fontsize=10)
     ax.set_ylabel('Loss (%)', fontsize=10)
     ax.set_title('Packet Loss over Position', fontsize=10, fontweight='semibold', pad=4)
     add_ap_bands(ax, x, ap, xmax, (0, loss_max))
@@ -217,7 +238,7 @@ def make_plot(sit, spd, out_root):
 
     ax.set_ylim(-0.4, 1.4); ax.set_xlim(xmin, xmax)
     ax.set_yticks([0, 0.5, 1])
-    ax.set_yticklabels(['MISS', 'UNKNOWN', 'HIT'], fontsize=9)
+    ax.set_yticklabels(['MISS', 'LOSS', 'HIT'], fontsize=9)
     ax.set_ylabel('Cache Status', fontsize=10)
     ax.set_xlabel('Position (m)', fontsize=10)
     ax.set_title('Cache Hit / Miss over Position', fontsize=10, fontweight='semibold', pad=4)

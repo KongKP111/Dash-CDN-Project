@@ -19,7 +19,15 @@ AP_COVERAGE  = 300.0                           # m per AP (overlap = 100 m)
 START_X      = -300.0                          # m  (AP1 coverage edge)
 END_X        = 1800.0                          # m  (AP4 coverage edge)
 SPEED_MPS    = {20: 20/3.6, 25: 25/3.6, 30: 30/3.6}   # km/h → m/s
-SAMPLE_DT    = 1.0                            # s
+# 0.5s, not 1.0 -- aligned to match CDN_SIT1/Situation1_DASH's shared
+# campus_config.py (SAMPLE_DT_S=0.5) and dash-baseline/baseline_4rsu_model.py
+# (SAMPLE_DT=0.5), the two other places this project samples a 4-AP/RSU
+# handover scenario. CDN_baseline (and CDN_SIT2/SIT3, which import this same
+# constant) were the only outlier at 1.0. Safe to change: since Option 2,
+# position is derived from real wall-clock elapsed time, not accumulated
+# from SAMPLE_DT, so this only affects sampling/logging density, not
+# position accuracy.
+SAMPLE_DT    = 0.5                            # s
 
 # ── RSSI model (identical to DASH) ────────────────────────────────────────
 RSSI_REF_DBM = -29.0
@@ -155,18 +163,22 @@ def loss_from_rssi(rssi_dbm):
 #
 # CDN_BITRATE_MBPS is measured directly off Video.mp4's video stream
 # (`ffprobe -select_streams v:0 -show_entries stream=bit_rate Video.mp4`
-# -> 4,809,772 bps). Re-encoded 2026-07-09 from the same pristine source
+# -> 4,965,301 bps). Re-encoded 2026-07-10 from the same pristine source
 # (~/sdn-vanet-project/bbb_sunflower_1080p_30fps_normal.mp4) DASH's ladder
-# uses, with the EXACT same libx264 settings as its 1080p rung
-# (-b:v 5000k -maxrate 5500k -bufsize 10000k, veryfast/main/yuv420p) --
-# lands at 4.81 Mbps rather than exactly 5.0 because that's single-pass
-# constrained VBR, same as DASH's own ladder encode (not 2-pass), so this
-# is the expected result of matching DASH's actual encoding recipe, not a
-# shortfall. Video2.mp4 is a byte-identical copy (see their md5sums).
-CDN_BITRATE_MBPS = 4.81
+# uses, same libx264 settings as its 1080p rung (-b:v 5000k -maxrate 5500k
+# -bufsize 10000k, veryfast/main/yuv420p) but as a proper 2-pass encode
+# this time (-pass 1/-pass 2) instead of single-pass -- the original
+# single-pass encode (kept at CDN/origin/_old_4.81mbps_encode/) landed at
+# 4.81 Mbps, a ~4% undershoot from the 5.0 Mbps target that's a known
+# single-pass VBR characteristic, not anything wrong with the settings.
+# 2-pass rate control targets the requested average bitrate far more
+# precisely -- 4.97 Mbps is within 0.7% of DASH's 5.0 Mbps top rung, vs.
+# the previous ~4% gap. Video2.mp4 is a byte-identical copy (see their
+# md5sums).
+CDN_BITRATE_MBPS = 4.97
 MU = 1.0    # standard default, same as DASH
 
-def cdn_qoe(stall):
+def cdn_qoe(stall, dt=1.0):
     """Return this sample's Yin et al. QoE term: q(R) - mu*switch - T_k.
     Summing across a run's rows gives the run's total QoE from the formula
     (mirrors compute_dash_qoe() in dash_cdn_comparison.py).
@@ -178,8 +190,20 @@ def cdn_qoe(stall):
     cdn_baseline_topo_sdn.py's `stall = (latency >= 3.0 or cache ==
     'UNKNOWN' or vlc_stalling)`), so re-checking a latency threshold here
     too would just be a redundant, easy-to-drift-out-of-sync duplicate of
-    that condition."""
-    rebuf_s = 1.0 if stall else 0.0
+    that condition.
+
+    `dt` is this row's REAL elapsed seconds since the previous row (T_k must
+    be real seconds, per the formula) -- default 1.0 only for a caller with
+    no timing info at all. compute_cdn_qoe() below always passes the real
+    value: since Option 2 (wall-clock-driven position, no freeze during
+    handover), a tick's real duration is not a fixed constant -- verified on
+    a real run's CSV, inter-row dt ranged 0.9-5.0s, not a flat 1.0s -- and
+    CDN_SIT1 feeds this same function 0.5s-nominal ticks (campus_config.py's
+    SAMPLE_DT_S), not this file's own 1.0s SAMPLE_DT. A hardcoded 1.0
+    overcounts every stalled row's rebuffer penalty whenever its real dt is
+    less than 1.0s (e.g. ~2x for CDN_SIT1's 0.5s ticks) and undercounts it
+    whenever dt runs long (e.g. a struggling handover retry)."""
+    rebuf_s = dt if stall else 0.0
     return CDN_BITRATE_MBPS - rebuf_s
 
 def compute_cdn_qoe(rows):
@@ -190,8 +214,19 @@ def compute_cdn_qoe(rows):
     CSV only stores signals (cache, latency_s, stall, handover), same as the
     DASH arm's raw CSV never bakes in a qoe value either. Compute it here
     instead, so a formula change (mu, thresholds, ...) never requires
-    re-running the experiment, just recomputing from the CSV on disk."""
-    return [
-        cdn_qoe(int(r['stall']))
-        for r in rows
-    ]
+    re-running the experiment, just recomputing from the CSV on disk.
+
+    dt is derived from consecutive rows' own 't' column (real elapsed
+    seconds, not a fixed SAMPLE_DT) -- see cdn_qoe()'s docstring. The first
+    row has no previous timestamp to diff against, so its dt is 0.0 (that
+    row's own stall, if any, contributes no rebuffer penalty) -- a minor,
+    unavoidable edge case, not a source of systematic bias since it's only
+    ever one row per run."""
+    qoes = []
+    prev_t = None
+    for r in rows:
+        t = float(r['t'])
+        dt = (t - prev_t) if prev_t is not None else 0.0
+        qoes.append(cdn_qoe(int(r['stall']), dt))
+        prev_t = t
+    return qoes

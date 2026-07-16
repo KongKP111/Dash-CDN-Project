@@ -1,0 +1,4 @@
+run_id,t,x,ap_from,ap_to,wifi_assoc_ms
+cdn_sdn_hightspeed_sit1_spd80_r1,25.1,258.1,ap1,ap2,944.275
+cdn_sdn_hightspeed_sit1_spd80_r1,48.3,773.6,ap2,ap3,941.554
+cdn_sdn_hightspeed_sit1_spd80_r1,70.4,1265.5,ap3,ap4,958.477

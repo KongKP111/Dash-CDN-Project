@@ -58,6 +58,18 @@ VLC_PLAYER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vl
 
 HANDOVER_SETTLE_TIME = 0.60
 
+# Option 2 (ported from CDN_SIT2/cdn_sdn_hight_speed.py, see that file's
+# module docstring + DASH_HANDOFF_SITUATION2.md for the full story): the
+# drive clock is NEVER paused during a handover -- the simulated vehicle
+# keeps moving in real time while WiFi re-association is attempted, so a
+# handover that can't complete before the car leaves the AP's range shows up
+# as a genuine outage instead of being silently hidden by freezing position.
+# HANDOVER_TIMEOUT_S bounds how long the tick loop (see run_loop_sdn) will
+# keep retrying association -- one attempt per tick, against whichever AP is
+# nearest NOW, re-checked every attempt -- before giving up and recording a
+# real outage. Without this cap a persistent failure would retry forever.
+HANDOVER_TIMEOUT_S = 8.0
+
 # small buffer over the nominal coverage radius, matching
 # dash-baseline/baseline_4rsu_topo.py's RANGE_M exactly. Previously this was
 # AP_COVERAGE*1.5 (450m on a 500m AP spacing -- 400m of overlap between
@@ -169,7 +181,13 @@ def vlc_start(car1, out_dir, run_id, initial_url, show=False):
          % (' (with video window)' if show else '', initial_url))
     car1.cmd(
         '%spython3 %s --run-id %s --initial-ap 1 --initial-url %s '
-        '--ctrl-file %s --telemetry-csv %s --events-csv %s %s '
+        '--ctrl-file %s --telemetry-csv %s --events-csv %s '
+        # DASH's own VLC launches (dash-baseline/baseline_4rsu_topo.py) use
+        # --network-caching=3000 -- vlc_player.py's own default (5000ms)
+        # left the CDN arm needing 2s more buffered before resuming than
+        # DASH ever did, an unmatched-settings unfairness in DASH's favor,
+        # not a real architectural difference worth measuring. Match it.
+        '--network-caching-ms 3000 %s '
         '> %s 2>&1 &'
         % (env_prefix, VLC_PLAYER_SCRIPT, run_id, initial_url,
            paths['ctrl'], paths['tel'], paths['evt'], show_flag, paths['log'])
@@ -322,6 +340,59 @@ def ensure_assoc_sdn(car1, ap, ap_idx, retries=8, wait=1.0):
             return True
     info('*** Could not associate with ap%d\n' % (ap_idx+1,))
     return False
+
+
+def _try_associate_once(car1, ap, settle_s=0.8):
+    """Single WiFi (re)association attempt against `ap` -- the same
+    disconnect+`iw connect`+BSSID-verify body as ensure_assoc_sdn()'s inner
+    loop, factored out so run_loop_sdn()'s tick-loop state machine can
+    re-target a fresh AP on every attempt instead of hammering one fixed
+    target, with each attempt landing as its own real measurement sample.
+
+    settle_s matters: `iw connect` returns as soon as it ISSUES the request,
+    not once the handshake actually completes -- ensure_assoc_sdn() sleeps
+    `wait` (0.8s there) between issuing connect and checking `iw link` for
+    exactly this reason. Checking immediately (no sleep) means almost every
+    attempt gets checked before the radio had any real chance to finish, so
+    it looks like association is failing when it would often have succeeded
+    a few hundred ms later -- this bit CDN_SIT2 once already (a run that
+    looked like near-total outage for half the trip turned out to be this
+    race, not a real finding) -- keep the sleep."""
+    target_mac = ''
+    try:
+        target_mac = ap.cmd(
+            'cat /sys/class/net/%s-wlan1/address' % ap.name).strip().lower()
+    except Exception:
+        pass
+
+    intf = car1.wintfs[0]
+    ap_intf = ap.wintfs[0]
+    bssid = target_mac or ap_intf.mac
+    freq_mhz = ap_intf.format_freq()
+
+    intf.associatedTo = None
+    try:
+        car1.cmd('iw dev car1-wlan0 disconnect')
+        car1.cmd('iw dev car1-wlan0 connect %s %s %s'
+                  % (ap_intf.ssid, freq_mhz, bssid))
+    except Exception as e:
+        info('*** [dynamic-assoc] exception: %s\n' % e)
+        return False
+
+    time.sleep(settle_s)
+    link = car1.cmd('iw dev car1-wlan0 link')
+    if 'Connected to' not in link:
+        return False
+    m = re.search(r'Connected to ([0-9a-f:]{17})', link)
+    if target_mac and not (m and m.group(1).lower() == target_mac):
+        return False
+
+    intf.freq = ap_intf.freq
+    intf.channel = ap_intf.channel
+    intf.mode = ap_intf.mode
+    intf.ssid = ap_intf.ssid
+    intf.associatedTo = ap_intf
+    return True
 
 
 def topology(args):
@@ -586,11 +657,21 @@ def run_loop_sdn(car1, server, srv_if, aps, video_file, sit,
     with open(out_csv, 'w') as f:
         f.write('t,x,dist,ap,rssi,rssi_src,bw_mbps,cache,latency_s,'
                 'speed_bps,loss_pct,stall,vlc_buffer_pct,vlc_cum_stall_s,'
-                'handover,vehicle_speed_kmh\n')
+                'handover,vehicle_speed_kmh,outage,cum_outage_s\n')
 
-        prev_ap      = -1
-        total_paused = 0.0
-        total        = (M.END_X - M.START_X) / speed_mps
+        prev_ap        = -1
+        cum_outage_s   = 0.0
+        # Handover-in-progress state, carried ACROSS tick loop iterations --
+        # see the while-loop below: each pass through the loop performs at
+        # most ONE association attempt (not a bounded inner retry loop), so
+        # a struggling handover produces one real measurement sample per
+        # attempt instead of one big jump from the last good sample straight
+        # to whenever it finally resolves.
+        handover_active      = False
+        handover_start_wall  = 0.0
+        handover_attempts    = 0
+        handover_from_ap     = -1
+        total          = (M.END_X - M.START_X) / speed_mps
 
         info('*** Drive %.0f→%.0f m @ %.1f km/h (%.0fs total)\n'
              % (M.START_X, M.END_X, speed_kmh, total))
@@ -610,7 +691,12 @@ def run_loop_sdn(car1, server, srv_if, aps, video_file, sit,
         t_start = time.monotonic()
 
         while True:
-            drive_time = time.monotonic() - t_start - total_paused
+            tick_wall_start = time.monotonic()
+
+            # Option 2: drive_time is always true wall-clock elapsed time --
+            # the simulated vehicle keeps advancing in position even while a
+            # handover/association attempt below is in progress.
+            drive_time = time.monotonic() - t_start
             x = M.START_X + drive_time * speed_mps
             t = drive_time
             if x > M.END_X:
@@ -619,83 +705,168 @@ def run_loop_sdn(car1, server, srv_if, aps, video_file, sit,
             car1.setPosition('%.1f,0,0' % x)
             time.sleep(0.05)
 
-            ap_idx = M.nearest_ap_index(x)
-            d      = abs(x - M.AP_POSITIONS[ap_idx])
-            rssi   = parse_rssi(car1.cmd('iw dev car1-wlan0 link'))
+            nearest_idx = M.nearest_ap_index(x)
+            outage = False
+            handover = False
+
+            is_first_tick = (prev_ap == -1)
+            if is_first_tick:
+                prev_ap = nearest_idx  # topology() already associated AP1
+            ap_idx = prev_ap
+
+            # Detect a NEW handover need (only if not already mid-attempt) --
+            # either the nearest AP changed, or the link spontaneously
+            # dropped while still supposedly on the same AP. Reactive-only
+            # trigger, matching Situation1_DASH/CDN_SIT1's own reactive
+            # handover (no proactive early-trigger) so every arm in this
+            # project uses the same handover-timing methodology.
+            if not is_first_tick and not handover_active:
+                needs_handover = (nearest_idx != prev_ap)
+                link_ok = True
+                if not needs_handover:
+                    link = car1.cmd('iw dev car1-wlan0 link')
+                    link_ok = 'Connected to' in link
+                if needs_handover or not link_ok:
+                    handover_active = True
+                    handover_start_wall = time.monotonic()
+                    handover_attempts = 0
+                    handover_from_ap = prev_ap
+                    if needs_handover and do_coop:
+                        # Pre-warm next edge NOW, before association --
+                        # background curl completes in ~220ms (200ms WAN +
+                        # loopback), well inside even a fast handover.
+                        cooperative_warm(server, nearest_idx, video_file, block=False)
+                    if not needs_handover and not link_ok:
+                        info('*** Link lost — re-associating with ap%d\n' % (nearest_idx+1,))
+
+            # One association attempt per tick -- NOT a blocking inner retry
+            # loop. A handover that takes N attempts to resolve now produces
+            # N real measurement samples (each with its own x, RSSI, etc.)
+            # instead of one sample at the start and one after everything
+            # finally resolves.
+            if handover_active:
+                handover_attempts += 1
+                target_idx = M.nearest_ap_index(x)  # re-target fresh -- car may
+                ap_idx = target_idx                 # have drifted to a different
+                                                     # AP since the attempt began
+                ok = _try_associate_once(car1, aps[target_idx])
+                elapsed_budget = time.monotonic() - handover_start_wall
+
+                if ok:
+                    handover_active = False
+                    ho_exec_ms = elapsed_budget * 1000.0
+                    flush_host_state(car1, server)
+                    warmup_connectivity(car1, server)
+                    if handover_from_ap != -1 and handover_from_ap != target_idx:
+                        handover = True
+                        ho_csv.write('%s,%.1f,%.1f,ap%d,ap%d,%.3f\n' % (
+                            run_id, t, x, handover_from_ap+1, target_idx+1, ho_exec_ms))
+                        ho_csv.flush()
+                        time.sleep(HANDOVER_SETTLE_TIME)
+                        if do_coop:
+                            _wait_for_coop_warm(server, target_idx)
+                        vlc_switch(car1, vlc_paths, target_idx,
+                                   'http://%s:%d/%s' % (EDGE_IP, EDGE_PORTS[target_idx], video_file))
+                    prev_ap = target_idx
+                    info('*** [assoc] associated ap%d (attempt %d, %.1fs)%s\n'
+                         % (target_idx+1, handover_attempts, elapsed_budget,
+                            '  [HO]' if handover else ''))
+                elif elapsed_budget >= args.handover_timeout:
+                    handover_active = False
+                    outage = True
+                    info('*** OUTAGE: gave up after %.1fs (%d attempts, x=%.1f)\n'
+                         % (elapsed_budget, handover_attempts, x))
+                    # prev_ap deliberately left unchanged -- next tick
+                    # re-evaluates nearest_ap_index(x) at the (now further
+                    # along) position and starts a fresh handover attempt
+                    # against whatever AP that is.
+                else:
+                    # Still trying, not yet past the giveup threshold -- every
+                    # attempt starts with an explicit `iw disconnect`, so this
+                    # tick is genuinely disconnected too, just not a final
+                    # give-up yet.
+                    outage = True
+
+            # outage (interim retry OR final give-up) costs real wall-clock
+            # time with zero connectivity -- charge THIS tick's own duration
+            # to cum_outage_s so a struggle that eventually succeeds still
+            # counts, not just ones that hit the timeout and give up.
+            if outage:
+                cum_outage_s += time.monotonic() - tick_wall_start
+
+            d    = abs(x - M.AP_POSITIONS[ap_idx])
+            rssi = parse_rssi(car1.cmd('iw dev car1-wlan0 link'))
             rssi_src = 'live'
             if rssi is None:
                 rssi = M.rssi_from_distance(d)
                 rssi_src = 'model'
 
-            handover = (ap_idx != prev_ap and prev_ap != -1)
-            if ap_idx != prev_ap:
-                ho_start = time.monotonic()
-
-                # SDN cooperative: pre-warm next edge NOW, before association.
-                # Background curl completes in ~220 ms (200 ms WAN + loopback).
-                # WiFi re-association takes ~5.7 s → cache is hot before car1
-                # makes its first request at the new AP zone.
-                if handover and do_coop:
-                    cooperative_warm(server, ap_idx, video_file, block=False)
-
-                if prev_ap != -1:  # skip on first tick — topology() already ensured AP1
-                    ensure_assoc_sdn(car1, aps[ap_idx], ap_idx, retries=4, wait=0.8)
-                ho_exec_ms = (time.monotonic() - ho_start) * 1000.0
-                if handover:
-                    ho_csv.write('%s,%.1f,%.1f,ap%d,ap%d,%.3f\n' % (
-                        run_id, t, x, prev_ap+1, ap_idx+1, ho_exec_ms))
-                    ho_csv.flush()
-                    flush_host_state(car1, server)
-                    warmup_connectivity(car1, server)
-                    time.sleep(HANDOVER_SETTLE_TIME)
-                    if do_coop:
-                        _wait_for_coop_warm(server, ap_idx)
-                    vlc_switch(car1, vlc_paths, ap_idx,
-                               'http://%s:%d/%s' % (EDGE_IP, EDGE_PORTS[ap_idx], video_file))
-                total_paused += time.monotonic() - ho_start
-                prev_ap = ap_idx
-            else:
-                link = car1.cmd('iw dev car1-wlan0 link')
-                if 'Connected to' not in link:
-                    info('*** Link lost — re-associating with ap%d\n' % (ap_idx+1,))
-                    ho_start = time.monotonic()
-                    ensure_assoc_sdn(car1, aps[ap_idx], ap_idx, retries=4, wait=0.8)
-                    flush_host_state(car1, server)
-                    warmup_connectivity(car1, server)
-                    total_paused += time.monotonic() - ho_start
-
-            if hyst_mapper is not None:
+            if outage:
+                # Known, verified outage -- don't let the synthetic
+                # distance-model RSSI fallback above quietly imply a normal,
+                # plausible signal here; make the true "no link" state
+                # explicit instead of hiding it behind a model value the car
+                # isn't actually receiving.
+                rssi_src = 'none'
+                bw = 0.0
+            elif hyst_mapper is not None:
                 bw = hyst_mapper.update(rssi)
             else:
                 bw = M.throughput_from_rssi(rssi, mode=args.bw_mapping)
             set_tc(server, srv_if, bw)
 
-            cache, latency, speed_bps = measure_cdn(
-                car1, video_file, EDGE_IP, EDGE_PORTS[ap_idx])
+            if outage:
+                # No L2 link at all -- skip the HTTP probe entirely rather
+                # than burning a real 3s curl timeout proving what the
+                # association attempt above already told us; a real device
+                # wouldn't even attempt a request with no link either.
+                cache, latency, speed_bps = 'LOSS', 3.0, 0.0
+            else:
+                cache, latency, speed_bps = measure_cdn(
+                    car1, video_file, EDGE_IP, EDGE_PORTS[ap_idx])
+                # measure_cdn() defaults to its own 'UNKNOWN' when the curl
+                # never got a X-Cache-Status header back (request timed out
+                # even though we believed the link was up). Cache HIT/MISS
+                # is strictly an edge-content question -- content is either
+                # cached (HIT) or not (MISS); "don't know" isn't a real
+                # state, a request that got no answer at all is a
+                # connection/request LOSS, same bucket as a verified outage,
+                # not a third cache tier.
+                if cache == 'UNKNOWN':
+                    cache = 'LOSS'
 
             loss = loss_probe.poll()
+            if outage:
+                loss = 100.0
             vlc_stalling, vlc_buffer_pct, vlc_cum_stall_s = vlc_tel.poll()
             # a stall is a stall whether it shows up as network-side latency
-            # (cache MISS timeout) or as a real libvlc buffer underrun --
-            # either signal on its own is enough to count this tick as one.
-            stall = (latency >= 3.0 or cache == 'UNKNOWN' or vlc_stalling)
+            # (cache MISS timeout), a real libvlc buffer underrun, or a
+            # verified outage/loss -- any one signal on its own is enough to
+            # count this tick as one.
+            stall = (latency >= 3.0 or cache == 'LOSS' or vlc_stalling or outage)
 
-            f.write('%.1f,%.1f,%.1f,ap%d,%.2f,%s,%.3f,%s,%.4f,%.0f,%.3f,%d,%.1f,%.3f,%d,%d\n' % (
+            f.write('%.1f,%.1f,%.1f,ap%d,%.2f,%s,%.3f,%s,%.4f,%.0f,%.3f,%d,%.1f,%.3f,%d,%d,%d,%.3f\n' % (
                 t, x, d, ap_idx+1, rssi, rssi_src, bw, cache,
                 latency, speed_bps, loss, int(stall), vlc_buffer_pct,
-                vlc_cum_stall_s, int(handover), speed_kmh))
+                vlc_cum_stall_s, int(handover), speed_kmh,
+                int(outage), cum_outage_s))
             f.flush()
 
             if live_plot:
                 live_plot.update(t, x, ap_idx, rssi, bw, cache, latency)
 
+            if outage:
+                outage_tag = '  [OUTAGE-RETRYING]' if handover_active else '  [OUTAGE-GAVEUP]'
+            else:
+                outage_tag = ''
             info('  t=%4.0fs x=%+6.1f AP=ap%d rssi=%6.2f(%s) bw=%5.2fMbps '
-                 '%s lat=%.3fs loss=%.1f%% vlc_buf=%.0f%%%s\n'
+                 '%s lat=%.3fs loss=%.1f%% vlc_buf=%.0f%%%s%s\n'
                  % (t, x, ap_idx+1, rssi, rssi_src, bw, cache.ljust(7),
                     latency, loss, vlc_buffer_pct,
-                    '  [HO]' if handover else ''))
+                    '  [HO]' if handover else '',
+                    outage_tag))
 
-            used = time.monotonic() - t_start - total_paused - drive_time
+            used = time.monotonic() - tick_wall_start
             remaining = M.SAMPLE_DT - used
             if remaining > 0.05:
                 time.sleep(remaining)
@@ -734,6 +905,14 @@ if __name__ == '__main__':
                          'the mapping dash-baseline landed on (best QoE, '
                          'fewest switches) — keep it in sync with the DASH '
                          'arm for a fair comparison (TEAMMATE_SETUP.md #2).')
+    p.add_argument('--handover-timeout', dest='handover_timeout', type=float,
+                    default=HANDOVER_TIMEOUT_S,
+                    help='max real seconds run_loop_sdn()\'s tick loop keeps '
+                         'retrying WiFi association (one attempt per tick) '
+                         'during a handover before giving up and recording a '
+                         'real outage (default %.1f). The simulated vehicle '
+                         'keeps moving in real time the whole time this '
+                         'runs.' % HANDOVER_TIMEOUT_S)
     args = p.parse_args()
     setLogLevel('info')
     topology(args)

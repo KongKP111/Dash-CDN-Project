@@ -298,6 +298,17 @@ def main():
             pos_ms = player.get_time()
             length_ms = player.get_length()
             st = player.get_state()
+            # state.cum_stall_time_s only gets credited with a stall's
+            # duration at STALL_END (handle_queue_item above) -- a stall
+            # that's still ongoing at sample time (including one that never
+            # recovers before the run ends) would otherwise report 0 real
+            # seconds no matter how long it's actually run, silently
+            # under-counting the worst case this metric exists to catch.
+            # Add the live in-progress duration on top of the completed-
+            # stalls total for what's actually written to telemetry.
+            live_cum_stall_s = state.cum_stall_time_s
+            if state.currently_stalling and state.stall_start_ts is not None:
+                live_cum_stall_s += (now - state.stall_start_ts)
             tel_w.writerow([
                 '%.3f' % now, '%.3f' % (now - t0),
                 state.current_ap, state.current_url,
@@ -305,7 +316,7 @@ def main():
                 '%.3f' % (max(length_ms, 0) / 1000.0 if length_ms else 0.0),
                 str(st), int(state.currently_stalling),
                 '%.1f' % state.last_buffer_pct,
-                state.cum_stall_events, '%.3f' % state.cum_stall_time_s,
+                state.cum_stall_events, '%.3f' % live_cum_stall_s,
             ])
             tel_f.flush()
 

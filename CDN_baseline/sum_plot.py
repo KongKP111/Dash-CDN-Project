@@ -30,9 +30,14 @@ C_HO    = "#e89c00"
 C_HIT   = "#0ca30c"
 C_MISS  = "#e34948"
 C_UNK   = "#888888"
-NOSDN_DOT = {'HIT': C_NOSDN, 'MISS': C_MISS, 'UNKNOWN': C_UNK}
-SDN_DOT   = {'HIT': C_HIT,   'MISS': C_MISS, 'UNKNOWN': C_UNK}
-CV_MAP    = {'HIT': 1, 'MISS': 0, 'UNKNOWN': 0.5}
+# 'LOSS' replaces the old 'UNKNOWN' tier (cdn_baseline_topo[_sdn].py's
+# outage tracking) -- cache HIT/MISS is strictly an edge-content question; a
+# request that got no answer at all (outage or a timed-out probe) is a
+# connection LOSS, not a third cache state. 'UNKNOWN' kept as a fallback key
+# too for any older CSV that still has literal 'UNKNOWN' rows.
+NOSDN_DOT = {'HIT': C_NOSDN, 'MISS': C_MISS, 'LOSS': C_UNK, 'UNKNOWN': C_UNK}
+SDN_DOT   = {'HIT': C_HIT,   'MISS': C_MISS, 'LOSS': C_UNK, 'UNKNOWN': C_UNK}
+CV_MAP    = {'HIT': 1, 'MISS': 0, 'LOSS': 0.5, 'UNKNOWN': 0.5}
 
 SPEEDS = [20, 25, 30]
 
@@ -97,7 +102,7 @@ def draw_cache(ax, tn, ts, cache_n, cache_s, tmax, trans, show_ylabel):
                    color=SDN_DOT[c2], edgecolors='none', zorder=5)
     ax.set_ylim(-0.4, 1.4); ax.set_xlim(0, tmax)
     ax.set_yticks([0, 0.5, 1])
-    ax.set_yticklabels(['M', 'U', 'H'], fontsize=7)
+    ax.set_yticklabels(['M', 'L', 'H'], fontsize=7)
     if show_ylabel: ax.set_ylabel('Cache', fontsize=9)
     add_ho(ax, trans, (-0.4, 1.4))
 
@@ -176,7 +181,7 @@ def make_summary(sit, out_root):
         mlines.Line2D([],[],marker='s',color='w',markerfacecolor=C_HIT,
                       markersize=7,label='SDN HIT (■)'),
         mpatches.Patch(color=C_MISS, label='MISS'),
-        mpatches.Patch(color=C_UNK,  label='UNKNOWN'),
+        mpatches.Patch(color=C_UNK,  label='LOSS'),
     ]
     fig.legend(handles=leg_handles, loc='lower center', ncol=7,
                fontsize=8.5, framealpha=0.9,

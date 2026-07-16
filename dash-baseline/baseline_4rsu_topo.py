@@ -76,6 +76,13 @@ RUN_ID_FILE = "/tmp/current_run_id.txt"
 
 RANGE_M = int(M4.COVERAGE_M) + 50   # small buffer over the nominal coverage radius
 
+# Matches CDN_baseline/cdn_baseline_topo_sdn.py's own HANDOVER_TIMEOUT_S=8.0
+# exactly -- see run_loop()'s per-tick handover state machine below, ported
+# from that file (and CDN_SIT1/Situation1_DASH's platoon loops) so this
+# arm's handover timing methodology matches the CDN side instead of the
+# fixed-increment/reactive-only design it used before.
+HANDOVER_TIMEOUT_S = 8.0
+
 
 def topology(args):
     if not os.path.isfile(os.path.join(CONTENT_DIR, "index.mpd")):
@@ -210,14 +217,31 @@ def topology(args):
 
 
 def run_loop(car1, server1, srv_if, aps, args):
+    """Wall-clock-driven position (Option 2) + reactive per-tick
+    single-attempt handover state machine + outage tracking -- ported from
+    CDN_baseline/cdn_baseline_topo_sdn.py's run_loop_sdn() (and matching
+    CDN_SIT1/Situation1_DASH's own reactive-only trigger, kept consistent
+    project-wide rather than adding a proactive early-trigger only some
+    arms had) so this arm's handover/timing methodology matches the CDN
+    side instead of the previous fixed-increment/no-outage-column design.
+    See that file's own comments for the full reasoning behind each piece;
+    not re-derived here.
+
+    Previously: `t += SAMPLE_DT; x += SPEED_MPS * SAMPLE_DT` unconditionally
+    every iteration, so a slow/failed handover cost nothing in simulated
+    position or time -- the exact same "frozen position" problem CDN_baseline
+    had before Option 2, structurally unable to show a real handover's cost.
+    A failed handover also silently fell through to computing d/rssi/bw
+    against the STALE rsu it never left, with no record that anything had
+    gone wrong (same bug class CDN_baseline's own outage tracking fixed).
+    """
     poller = QualityPoller(HTTP_LOG)
     loss_probe = PingLossPoller()
     rebuf = RebufferEstimator()
     f = open(args.out, "w")
-    f.write("t,x,dist,rsu,rssi,rssi_src,bw_mbps,quality,quality_idx,seg,loss,stall,buffer_s,handover\n")
+    f.write("t,x,dist,rsu,rssi,rssi_src,bw_mbps,quality,quality_idx,seg,loss,"
+            "stall,buffer_s,handover,outage,cum_outage_s\n")
 
-    t = 0.0
-    x = M4.START_X
     total = (M4.END_X - M4.START_X) / M4.SPEED_MPS
     info("*** Driving %d->%d m @ %.2f m/s (%.0fs), 4 RSUs, bw-mapping=%s\n"
          % (M4.START_X, M4.END_X, M4.SPEED_MPS, total, args.bw_mapping))
@@ -229,26 +253,89 @@ def run_loop(car1, server1, srv_if, aps, args):
 
     cur_rsu = 0   # car1 already associated to aps[0] before warmup
     n_handovers = 0
+    cum_outage_s = 0.0
+    handover_active = False
+    handover_start_wall = 0.0
+    handover_attempts = 0
+    handover_from_rsu = -1
 
-    while x <= M4.END_X + 1e-9:
+    t_start = time.monotonic()
+    prev_t = 0.0
+    while True:
+        tick_wall_start = time.monotonic()
+        drive_time = tick_wall_start - t_start
+        x = M4.START_X + drive_time * M4.SPEED_MPS
+        t = drive_time
+        if x > M4.END_X:
+            break
+
         car1.setPosition("%.1f,0,0" % x)
-        time.sleep(args.settle)
+        time.sleep(0.05)
 
         nearest, _ = M4.nearest_rsu(x)
         handover_flag = 0
-        if nearest != cur_rsu:
-            info("*** Handover: rsu%d -> rsu%d @ x=%.1f (t=%.1f)\n"
-                 % (cur_rsu + 1, nearest + 1, x, t))
-            t_ho = time.time()
-            ok = ensure_assoc(car1, aps[nearest])
+        outage = False
+
+        # Trigger a new handover attempt not just when the nearest RSU
+        # changed, but also when the link spontaneously dropped while
+        # still nominally on the same RSU. Reactive-only trigger, matching
+        # Situation1_DASH/CDN_SIT1's own reactive handover (no proactive
+        # early-trigger) so every arm in this project uses the same
+        # handover-timing methodology.
+        if not handover_active:
+            needs_handover = (nearest != cur_rsu)
+            link_ok = True
+            if not needs_handover:
+                link_ok = "Connected to" in car1.cmd(
+                    "iw dev %s-wlan0 link" % car1.name)
+            if needs_handover or not link_ok:
+                handover_active = True
+                handover_start_wall = time.monotonic()
+                handover_attempts = 0
+                handover_from_rsu = cur_rsu
+                if needs_handover:
+                    info("*** Handover: rsu%d -> rsu%d @ x=%.1f (t=%.1f)\n"
+                         % (cur_rsu + 1, nearest + 1, x, t))
+                else:
+                    info("*** Link lost -- re-associating with rsu%d\n"
+                         % (nearest + 1,))
+
+        # One association attempt per tick -- NOT a blocking inner retry
+        # loop. A handover that takes N attempts to resolve now produces N
+        # real measurement samples instead of one before and one after.
+        if handover_active:
+            handover_attempts += 1
+            target_idx, _ = M4.nearest_rsu(x)  # re-target fresh -- car may
+            ok = ensure_assoc(car1, aps[target_idx], retries=1, wait=0.8)
+            elapsed = time.monotonic() - handover_start_wall
+
             if ok:
-                info("*** Handover confirmed in %.2fs\n" % (time.time() - t_ho))
-                cur_rsu = nearest
-                n_handovers += 1
-                handover_flag = 1
+                handover_active = False
+                if handover_from_rsu != -1 and handover_from_rsu != target_idx:
+                    handover_flag = 1
+                    n_handovers += 1
+                cur_rsu = target_idx
+                info("*** Handover confirmed in %.2fs (%d attempts)%s\n"
+                     % (elapsed, handover_attempts,
+                        "  [HO]" if handover_flag else ""))
+            elif elapsed >= HANDOVER_TIMEOUT_S:
+                handover_active = False
+                outage = True
+                info("*** OUTAGE: gave up after %.1fs (%d attempts, x=%.1f)\n"
+                     % (elapsed, handover_attempts, x))
+                # cur_rsu deliberately left unchanged -- next tick
+                # re-evaluates nearest_rsu(x) at the further-along position
+                # and starts a fresh attempt sequence.
             else:
-                info("*** WARNING: handover to rsu%d failed, staying on rsu%d\n"
-                     % (nearest + 1, cur_rsu + 1))
+                outage = True
+
+        if outage:
+            # outage (interim retry OR final give-up) costs real wall-clock
+            # time with zero connectivity -- charge THIS tick's own full
+            # real duration (setPosition settle + the handover attempt's
+            # own wait=0.8s), same convention as CDN_baseline's
+            # run_loop_sdn(), not just the small fixed settle sleep.
+            cum_outage_s += time.monotonic() - tick_wall_start
 
         d = abs(x - M4.RSU_X[cur_rsu])
         rssi = parse_rssi(car1.cmd("iw dev %s-wlan0 link" % car1.name))
@@ -256,7 +343,13 @@ def run_loop(car1, server1, srv_if, aps, args):
         if rssi is None:
             rssi = M4.rssi_from_distance(d); src = "model"
 
-        if hyst_mapper is not None:
+        if outage:
+            # Known, verified outage -- don't let the synthetic
+            # distance-model RSSI fallback above quietly imply a normal,
+            # plausible signal here.
+            src = "none"
+            bw = 0.0
+        elif hyst_mapper is not None:
             bw = hyst_mapper.update(rssi)
         else:
             bw = M4.throughput_from_rssi(rssi, mode=args.bw_mapping)
@@ -265,27 +358,36 @@ def run_loop(car1, server1, srv_if, aps, args):
         qidx, seg, n_new = poller.poll()
         qlabel = RUNG_LABEL.get(qidx, "buffering")
         loss = loss_probe.poll()
-        stall, buf = rebuf.update(n_new, M4.SAMPLE_DT)
+        if outage:
+            loss = 100.0
+        # Real elapsed time since the last sample, not the fixed SAMPLE_DT --
+        # since Option 2, a tick's real duration is no longer constant
+        # (varies with handover struggles), and RebufferEstimator.update()'s
+        # `dt` is meant to be "how much playback time this tick consumed",
+        # same reasoning as baseline_model.py's cdn_qoe() dt fix.
+        dt = t - prev_t
+        prev_t = t
+        stall, buf = rebuf.update(n_new, dt)
 
-        f.write("%.1f,%.1f,%.1f,%d,%.2f,%s,%.3f,%s,%d,%d,%.3f,%d,%.1f,%d\n"
+        f.write("%.1f,%.1f,%.1f,%d,%.2f,%s,%.3f,%s,%d,%d,%.3f,%d,%.1f,%d,%d,%.3f\n"
                 % (t, x, d, cur_rsu + 1, rssi, src, bw, qlabel, qidx, seg,
-                   loss, stall, buf, handover_flag))
+                   loss, stall, buf, handover_flag, int(outage), cum_outage_s))
         f.flush()
 
         if int(t) % 20 == 0:
-            info("  t=%5.0fs x=%+7.1f rsu%d rssi=%6.1f(%s) bw=%4.1f -> %s%s\n"
+            info("  t=%5.0fs x=%+7.1f rsu%d rssi=%6.1f(%s) bw=%4.1f -> %s%s%s\n"
                  % (t, x, cur_rsu + 1, rssi, src, bw, qlabel,
-                    "  [STALL]" if stall else ""))
+                    "  [STALL]" if stall else "",
+                    "  [OUTAGE]" if outage else ""))
 
-        t += M4.SAMPLE_DT
-        x += M4.SPEED_MPS * M4.SAMPLE_DT
-        extra = M4.SAMPLE_DT - args.settle
-        if extra > 0:
-            time.sleep(extra)
+        used = time.monotonic() - tick_wall_start
+        remaining = M4.SAMPLE_DT - used
+        if remaining > 0.05:
+            time.sleep(remaining)
 
     f.close()
-    info("*** Total rebuffering: %.1f s, handovers executed: %d\n"
-         % (rebuf.total_stall, n_handovers))
+    info("*** Total rebuffering: %.1f s, handovers executed: %d, outage: %.1fs\n"
+         % (rebuf.total_stall, n_handovers, cum_outage_s))
     info("*** CSV -> %s\n" % args.out)
 
 
